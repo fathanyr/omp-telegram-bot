@@ -788,11 +788,12 @@ async def perform_push(sess: dict, args: list[str], message) -> None:
 
     status = await message.reply_text("⏳ Pushing...")
     code, out, err = await git(cwd, *cmd)
-    detail = clean_text("\n".join(x for x in (out, err) if x)) or "(no output)"
+    detail = "\n".join(x for x in (out, err) if x) or "(no output)"
     try:
         await status.delete()
     except Exception:
         pass
+    await send_pre(message, "✅ <b>Push complete</b>\n" if code == 0 else "❌ <b>Push failed</b>\n", detail)
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
