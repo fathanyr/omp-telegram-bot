@@ -26,6 +26,10 @@ services:
       - ${HOST_OMP_HOME:?Set HOST_OMP_HOME to an absolute directory}:/home/omp/.omp
       # Provider definitions (may contain API keys).
       - ${HOST_OMP_CONFIG:?Set HOST_OMP_CONFIG to an absolute directory}:/home/omp/.config/oh-my-pi:ro
+      # GitHub SSH authority: the host key pair plus known_hosts, read-only.
+      # Point HOST_SSH_DIR at an empty directory when pushing with GITHUB_TOKEN
+      # over HTTPS instead of SSH.
+      - ${HOST_SSH_DIR:?Set HOST_SSH_DIR to an absolute SSH directory}:/home/omp/.ssh:ro
       # Mount only the intended repository/project root, never the whole home directory.
       - ${HOST_WORKSPACE_DIR:?Set HOST_WORKSPACE_DIR to an absolute workspace directory}:/workspace
     init: true

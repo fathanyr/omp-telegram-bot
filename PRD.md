@@ -7,7 +7,7 @@ The **OMP Telegram Bot** is a secure, interactive interface bridging the Telegra
 
 ## 2. Security & Access Model
 - **Whitelist Enforcement**: Require decimal numeric `ALLOWED_USER_ID` and accept only its private Telegram chat before launching subprocesses.
-- **Credential Isolation**: Keep Telegram tokens and OMP credentials outside tracked files and the Docker build context; the runtime OMP process can read mounted credentials.
+- **Credential Isolation**: Keep Telegram tokens, GitHub tokens, and OMP credentials outside tracked files and the Docker build context; the runtime OMP process can read mounted credentials. GitHub credentials/authority are injected into subprocesses through non-persisted Git environment variables.
 - **Process Isolation**: Run OMP in its own process group so `/stop` can terminate the active task concurrently.
 - **Container Scope**: Run under the workspace owner's unprivileged UID/GID, mount only the intended workspace, and do not globally trust Git repositories. Auto-approved OMP commands can still access everything reachable by the runtime account.
 
@@ -29,6 +29,7 @@ The **OMP Telegram Bot** is a secure, interactive interface bridging the Telegra
 ### 3.3 Git Branch Management
 - `/branch`: Lists local and remote branches sorted by recent commit date.
 - `/checkout <branch>`: Switches to an existing branch without unconditional fetch or branch-creation flags.
+- `/push [remote] [branch]`: Pushes local commits to the configured remote repository. Automatically detects upstream tracking branch, or defaults to `-u origin <branch>` when no tracking branch is configured. Operates non-interactively with `BatchMode=yes` and `GIT_TERMINAL_PROMPT=0`.
 
 ### 3.4 Process Control & Session Continuity
 - `/status`: Shows whether OMP is idle or currently executing, with run time and session ID.
@@ -42,7 +43,7 @@ The **OMP Telegram Bot** is a secure, interactive interface bridging the Telegra
 ## 4. Technical Stack & Deployment
 - **Runtime**: Python 3.12+ (Docker container or local virtual environment).
 - **Framework**: `python-telegram-bot` v22+ (pure `asyncio`).
-- **Containerization (Recommended)**: Docker Compose requires explicit absolute paths for the OMP binary, credentials, and narrow writable workspace.
+- **Containerization (Recommended)**: Docker Compose requires explicit absolute paths for the OMP binary, credentials, narrow writable workspace, and optional host SSH key directory (`/home/omp/.ssh:ro`). Includes `openssh-client` and Git configuration injection via `GIT_CONFIG_KEY_<n>`.
 - **Host Supervision (Alternative)**: `systemd` template runs as the non-root workspace owner with explicit absolute host paths and control-group termination.
 - **Output Sanitization**: Strips ANSI terminal escape codes; HTML entity escaping for Telegram HTML formatting; throttled real-time status updates (1.5s interval).
 - **Chunked JSON Parser**: `iter_json_lines()` bytearray reader safely handles large tool outputs (>64KB) without buffer overruns.

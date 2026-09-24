@@ -52,9 +52,20 @@ MAX_EVENTS = 16
 MAX_STREAM_TEXT = 65536
 FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "openai-codex/gpt-5.6-luna")
 
+# GitHub authority, supplied through .env: a personal access token for HTTPS
+# remotes and/or an SSH directory (mounted read-only in Docker) for
+# git@github.com: remotes. GIT_USER_* supply the commit identity, which an
+# ephemeral container has no other source for.
+GITHUB_TOKEN = (os.getenv("GITHUB_TOKEN") or "").strip()
+GITHUB_USERNAME = (os.getenv("GITHUB_USERNAME") or "x-access-token").strip() or "x-access-token"
+GIT_USER_NAME = (os.getenv("GIT_USER_NAME") or "").strip()
+GIT_USER_EMAIL = (os.getenv("GIT_USER_EMAIL") or "").strip()
+
 ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 CHOICE_RE = re.compile(r"^\s*(\d{1,2})[.)]\s+(.+?)\s*$")
 BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+PUSH_FLAGS = {"-u", "--set-upstream", "--force-with-lease", "--dry-run", "--tags"}
+PUSH_REF_RE = re.compile(r"^[a-zA-Z0-9_.\-/]+$")
 
 def format_answer(text: str) -> str:
     """Escape untrusted output, then translate paired Markdown bold to Telegram HTML."""
@@ -130,6 +141,41 @@ async def reject_busy(sess: dict, message) -> bool:
     return False
 
 
+def git_env() -> dict[str, str]:
+    """Environment for every git subprocess: GitHub authority plus commit identity.
+
+    Git resolves `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` pairs from the
+    environment, so the configured authority reaches omp and every shell it
+    spawns without writing the secret to disk. `GIT_TERMINAL_PROMPT=0` turns a
+    missing credential into an immediate error instead of a prompt no bot can
+    answer, and `BatchMode=yes` does the same for SSH passphrase prompts.
+    """
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
+    entries: list[tuple[str, str]] = []
+    if GIT_USER_NAME:
+        entries.append(("user.name", GIT_USER_NAME))
+    if GIT_USER_EMAIL:
+        entries.append(("user.email", GIT_USER_EMAIL))
+    if GITHUB_TOKEN:
+        # The token takes precedence: rewrite SSH remotes to authenticated HTTPS.
+        env["GITHUB_TOKEN"] = GITHUB_TOKEN
+        env["GITHUB_USERNAME"] = GITHUB_USERNAME
+        entries += [
+            ("url.https://github.com/.insteadOf", "git@github.com:"),
+            ("url.https://github.com/.insteadOf", "ssh://git@github.com/"),
+            ("credential.https://github.com/.username", GITHUB_USERNAME),
+            ("credential.https://github.com/.helper",
+             '!f() { echo username="$GITHUB_USERNAME"; echo password="$GITHUB_TOKEN"; }; f'),
+        ]
+    env["GIT_CONFIG_COUNT"] = str(len(entries))
+    for index, (key, value) in enumerate(entries):
+        env[f"GIT_CONFIG_KEY_{index}"] = key
+        env[f"GIT_CONFIG_VALUE_{index}"] = value
+    return env
+
+
 async def git(cwd: str, *args: str) -> tuple[int, str, str]:
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -138,6 +184,7 @@ async def git(cwd: str, *args: str) -> tuple[int, str, str]:
             cwd=cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=git_env(),
         )
     except FileNotFoundError:
         return 127, "", "git executable not found"
@@ -380,7 +427,7 @@ async def run_omp(user_id: int, prompt: str, message, context: ContextTypes.DEFA
     session_id = sess["omp_session_id"]
     model = sess["model"]
     chat_id = message.chat_id
-    env = os.environ.copy()
+    env = git_env()
     env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
     env["PATH"] = f"{Path(OMP_BIN).parent}:{Path.home()}/.local/bin:{env['PATH']}"
     status = await message.reply_text("⏳ Working...")
@@ -546,6 +593,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/pwd — current dir, branch, git status",
         "/branch — list local/remote branches",
         "/checkout &lt;branch&gt; — switch to an existing branch",
+        "/push [remote] [branch] — push commits to the remote",
         "/status — running task info",
         "/stop — abort the running task",
         "/reset — start a fresh omp session",
@@ -688,6 +736,63 @@ async def perform_checkout(sess: dict, args: list[str], message) -> None:
     sess["choice"] = None
     detail = clean_text("\n".join(x for x in (out, err) if x))
     await send_pre(message, f"✅ <b>Branch:</b> <code>{esc(branch or '?')}</code>\n", detail)
+
+
+async def cmd_push(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed_update(update):
+        return
+    sess = get_session(update.effective_user.id)
+    if await reject_busy(sess, update.message):
+        return
+    sess["busy"] = True
+    try:
+        await perform_push(sess, context.args or [], update.message)
+    finally:
+        sess["busy"] = False
+
+
+async def perform_push(sess: dict, args: list[str], message) -> None:
+    cwd = sess["cwd"]
+    code, _, _ = await git(cwd, "rev-parse", "--is-inside-work-tree")
+    if code != 0:
+        await message.reply_text("❌ Not a git repository.")
+        return
+
+    flags: list[str] = []
+    targets: list[str] = []
+    for arg in args:
+        if arg in PUSH_FLAGS:
+            flags.append(arg)
+        elif not arg.startswith("-") and PUSH_REF_RE.match(arg):
+            targets.append(arg)
+        else:
+            await message.reply_text(
+                f"❌ Unsupported argument: <code>{esc(arg)}</code>\n"
+                "Usage: <code>/push [remote] [branch] [-u|--tags|--dry-run|--force-with-lease]</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+    if targets:
+        cmd = ["push", *flags, *targets]
+    else:
+        branch = await current_branch(cwd)
+        if not branch:
+            await message.reply_text(
+                "❌ Detached HEAD. Name the destination explicitly, e.g. <code>/push origin main</code>.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        upstream_code, _, _ = await git(cwd, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+        cmd = ["push", *flags, *([] if upstream_code == 0 else ["-u", "origin", branch])]
+
+    status = await message.reply_text("⏳ Pushing...")
+    code, out, err = await git(cwd, *cmd)
+    detail = clean_text("\n".join(x for x in (out, err) if x)) or "(no output)"
+    try:
+        await status.delete()
+    except Exception:
+        pass
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -876,6 +981,7 @@ async def post_init(application: Application) -> None:
             BotCommand("pwd", "Current directory, branch, git status"),
             BotCommand("branch", "List git branches"),
             BotCommand("checkout", "Switch to an existing git branch"),
+            BotCommand("push", "Push commits to the remote"),
             BotCommand("model", "Show or switch the omp model"),
             BotCommand("status", "Show running task"),
             BotCommand("stop", "Abort running task"),
@@ -891,7 +997,8 @@ def main() -> None:
         logger.error("TELEGRAM_BOT_TOKEN is not set.")
         return
 
-    logger.info("Starting OMP Telegram Bot (omp=%s)", OMP_BIN)
+    logger.info("Starting OMP Telegram Bot (omp=%s, github_authority=%s)",
+                OMP_BIN, "token" if GITHUB_TOKEN else "ssh/host")
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).concurrent_updates(True).build()
 
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
@@ -899,6 +1006,7 @@ def main() -> None:
     app.add_handler(CommandHandler("pwd", cmd_pwd))
     app.add_handler(CommandHandler("branch", cmd_branch))
     app.add_handler(CommandHandler("checkout", cmd_checkout))
+    app.add_handler(CommandHandler("push", cmd_push))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("reset", cmd_reset))

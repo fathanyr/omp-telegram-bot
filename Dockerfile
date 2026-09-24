@@ -10,6 +10,7 @@ ARG USERNAME=omp
 # System dependencies required by the omp CLI and git workflows
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
+    openssh-client \
     bash \
     ca-certificates \
     curl \

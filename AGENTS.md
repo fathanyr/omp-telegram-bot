@@ -47,8 +47,11 @@ Telegram User (ID whitelist)
 | `stopped` | `bool` | Flag set by `/stop` for cancellation |
 | `started_at` | `float \| None` | `time.monotonic()` start stamp of the running task |
 | `lock` | `asyncio.Lock` | Serializes one omp task per user |
+| `busy` | `bool` | Set by `/push`, `/checkout`, and prompt runs; context-changing commands reject while true |
+| `generation` | `int` | Incremented on every context reset; invalidates stale inline-choice tokens |
+| `choice` | `dict \| None` | Pending inline numbered-choice token for the current generation |
 
-**Reset semantics**: `/cd`, `/checkout`, and `/model` selection (including `default`) clear `omp_session_id`. Context-changing commands are rejected during an active task; `/stop` remains available concurrently.
+**Reset semantics**: `/cd`, `/checkout`, and `/model` selection (including `default`) clear `omp_session_id` and bump `generation`. Context-changing commands are rejected during an active task; `/stop` remains available concurrently. `/push` does not change session context.
 
 **Failure semantics**: Do not automatically replay failed work after possible tool side effects; report failure so the user can inspect the workspace and decide whether to retry.
 
@@ -82,6 +85,7 @@ Tool summary line format: `🔧 <toolName>: <command|path|pattern|query|url|inte
 | `/cd <path>` | Resolve path within configured workspace boundary when set; validate directory, set cwd, clear session |
 | `/branch` | List local and remote branches |
 | `/checkout <branch>` | Checkout an existing branch without unconditional fetch; clear session |
+| `/push [remote] [branch]` | Push commits to the remote repository (auto-detects upstream or sets `-u origin <branch>`); batches authentication |
 | `/model` | List available models, show active selection and configured fallback |
 | `/model <choice>` | Switch active model selector and clear session |
 | `/model default` | Reset model selector and clear session |
@@ -101,6 +105,7 @@ Tool summary line format: `🔧 <toolName>: <command|path|pattern|query|url|inte
 - **Output sanitization**: Escape untrusted HTML and chunk Telegram messages within limits.
 - **Process group isolation**: `start_new_session=True` allows `/stop` to terminate descendants.
 - **Stream parsing**: Bytearray chunked buffer handles tool payloads >64KB safely.
+- **GitHub authority via environment**: `git_env()` injects `GITHUB_TOKEN`, commit identity, `GIT_TERMINAL_PROMPT=0`, and `GIT_SSH_COMMAND="ssh -o BatchMode=yes"` through `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` so credentials never touch disk; the same environment is passed to every `git()` call and to the `omp` subprocess.
 
 ---
 
@@ -114,5 +119,6 @@ The bot can run containerized (`docker compose`) or via host `systemd`:
 | `${HOST_OMP_HOME}` | `/home/omp/.omp` | rw | omp config, model catalog, sessions, credentials |
 | `${HOST_OMP_CONFIG}` | `/home/omp/.config/oh-my-pi` | ro | Provider definitions (`models.yaml`) |
 | `${HOST_WORKSPACE_DIR}` | `/workspace` | rw | One explicitly selected repository or project directory |
+| `${HOST_SSH_DIR}` | `/home/omp/.ssh` | ro | Host SSH keys (`id_ed25519`/`id_rsa`) and `known_hosts` for Git SSH remotes |
 
 Compose requires absolute host paths, maps host UID/GID, sets `WORKSPACE_ROOT=/workspace`, and does not grant blanket Git `safe.directory` trust. Host systemd runs as a non-root workspace owner with absolute host `OMP_BIN` and `DEFAULT_CWD`; set `WORKSPACE_ROOT` to confine `/cd` (without it, host navigation is unrestricted). The boundary restricts `/cd`, not OMP subprocess filesystem access. Only one polling instance may use a bot token.

@@ -8,7 +8,7 @@ An interactive Telegram bot that exposes the **`omp` (Oh My Pi)** agentic coding
 
 - 🚀 **Full OMP CLI Access**: Run agentic coding tasks, shell commands, file edits, and codebase questions directly through Telegram.
 - 📂 **Directory Navigation**: Use `/cd` within the configured workspace boundary; host runs without a boundary do not restrict navigation.
-- 🌿 **Git Branch Management**: Inspect changes with `/pwd`, list branches with `/branch`, and switch to an existing branch via `/checkout <branch>`.
+- 🌿 **Git Branch & Push Management**: Inspect changes with `/pwd`, list branches with `/branch`, switch branches with `/checkout <branch>`, and push commits directly with `/push`.
 - 🧩 **Model Switching**: Select a model with `/model <name>` or restore the CLI default with `/model default`; model changes start a fresh session. `FALLBACK_MODEL` identifies a configured alternative but failed work is not automatically replayed.
 - 🛑 **Task Cancellation**: `/stop` requests termination of the active OMP process group. A stopped task is not retried.
 - 🔄 **Session Continuity**: Prompts resume the current OMP session; `/reset` clears the session ID.
@@ -30,6 +30,7 @@ An interactive Telegram bot that exposes the **`omp` (Oh My Pi)** agentic coding
 | `/cd <path>` | Switch directory within the configured workspace boundary (relative or absolute path); starts a fresh session |
 | `/branch` | List local and remote branches |
 | `/checkout <branch>` | Switch to an existing branch; does not fetch remotes or create branches; starts a fresh session |
+| `/push [remote] [branch]` | Push commits to the remote repository (auto-detects upstream or sets `-u origin <branch>`) |
 | `/status` | Show active task, elapsed time, and session ID |
 | `/stop` | Terminate the active task, even while a prompt is running |
 | `/reset` | Start a fresh OMP session |
@@ -65,7 +66,9 @@ Copy the example environment file and fill in your credentials:
 cp .env.example .env
 ```
 
-Edit `.env` with a real token and decimal numeric `ALLOWED_USER_ID`; only that user's private chat is accepted. For Docker, replace all `/home/youruser/...` placeholders with existing absolute host paths (never `~`). `HOST_OMP_BIN` is the executable, `HOST_OMP_HOME` stores OMP sessions/authentication, `HOST_OMP_CONFIG` contains provider definitions, and `HOST_WORKSPACE_DIR` is the one intended project directory, not your home directory. Compose mounts that directory at `/workspace` and sets `WORKSPACE_ROOT=/workspace` for `/cd`.
+Edit `.env` with a real token and decimal numeric `ALLOWED_USER_ID`; only that user's private chat is accepted. For Docker, replace all `/home/youruser/...` placeholders with existing absolute host paths (never `~`). `HOST_OMP_BIN` is the executable, `HOST_OMP_HOME` stores OMP sessions/authentication, `HOST_OMP_CONFIG` contains provider definitions, `HOST_SSH_DIR` optionally mounts the host SSH keys for Git remote access, and `HOST_WORKSPACE_DIR` is the one intended project directory, not your home directory. Compose mounts that directory at `/workspace` and sets `WORKSPACE_ROOT=/workspace` for `/cd`.
+
+To enable GitHub pushes (`/push` or agent Git operations), configure `GITHUB_TOKEN` (for token authentication over HTTPS) or `HOST_SSH_DIR` (for host SSH key authentication with `git@github.com:` remotes). Optionally specify `GIT_USER_NAME` and `GIT_USER_EMAIL` for Git commit authorship.
 
 Set `HOST_UID` and `HOST_GID` to the workspace owner's IDs; Compose fixes `DEFAULT_CWD=/workspace` and `OMP_BIN=/usr/local/bin/omp`. `FALLBACK_MODEL` is optional.
 
