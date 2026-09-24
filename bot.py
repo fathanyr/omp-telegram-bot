@@ -63,27 +63,82 @@ GIT_USER_EMAIL = (os.getenv("GIT_USER_EMAIL") or "").strip()
 
 ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 CHOICE_RE = re.compile(r"^\s*(\d{1,2})[.)]\s+(.+?)\s*$")
-BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+# Bold markers must hug non-space text and must not straddle another `**`
+# (so `2 ** 3`, `**kwargs`, and `**kwargs ... **bold**` stay literal).
+BOLD_RE = re.compile(r"(?<!\*)\*\*(?!\s)((?:(?!\*\*).)+?)(?<!\s)\*\*(?!\*)", re.DOTALL)
+INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+FENCE_RE = re.compile(r"(?m)^[ \t]*```([^\n`]*)\n(.*?)(?:^[ \t]*```[^\n]*$|\Z)", re.DOTALL)
 PUSH_FLAGS = {"-u", "--set-upstream", "--force-with-lease", "--dry-run", "--tags"}
 PUSH_REF_RE = re.compile(r"^[a-zA-Z0-9_.\-/]+$")
+THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max", "auto")
+GIT_TIMEOUT = 180.0
+DIFF_LIMIT = 12000
+LOG_DEFAULT = 10
+LOG_MAX = 50
+MODEL_PAGE_SIZE = 16
 
-def format_answer(text: str) -> str:
-    """Escape untrusted output, then translate paired Markdown bold to Telegram HTML."""
+
+def esc(text: str) -> str:
+    return html.escape(text, quote=False)
+
+
+def clean_text(text: str) -> str:
+    return ANSI_RE.sub("", text).replace("\r\n", "\n").strip()
+
+
+def render_bold(text: str) -> str:
+    """Escape text and translate paired `**bold**` runs to Telegram HTML."""
     parts = BOLD_RE.split(text)
     return "".join(f"<b>{esc(part)}</b>" if index % 2 else esc(part)
                    for index, part in enumerate(parts))
 
 
+def render_inline(text: str) -> str:
+    """Escape text and translate inline `code` spans and bold runs to HTML."""
+    parts = INLINE_CODE_RE.split(text)
+    return "".join(f"<code>{esc(part)}</code>" if index % 2 else render_bold(part)
+                   for index, part in enumerate(parts))
+
+
+def render_fence(language: str, body: str) -> str:
+    """Render a fenced code block as highlighted Telegram HTML."""
+    language = re.sub(r"[^A-Za-z0-9+#-]", "", language)[:20]
+    attribute = f' class="language-{language}"' if language else ""
+    return f"<pre><code{attribute}>{esc(body.rstrip(chr(10)))}</code></pre>"
+
+
+def format_answer(text: str) -> str:
+    """Escape untrusted output, then render fences, inline code, and bold as HTML.
+
+    A fence without a closing marker (truncated output) is closed at the end of
+    the text so the reply still renders as code.
+    """
+    rendered: list[str] = []
+    position = 0
+    for match in FENCE_RE.finditer(text):
+        rendered.append(render_inline(text[position:match.start()]))
+        rendered.append(render_fence(match.group(1).strip(), match.group(2)))
+        position = match.end()
+    rendered.append(render_inline(text[position:]))
+    return "".join(rendered)
+
+
 def choice_options(text: str) -> list[tuple[str, str]]:
-    """Only offer buttons for a final, contiguous numbered question block."""
-    lines = text.rstrip().splitlines()
+    """Only offer buttons for a final, contiguous numbered question block.
+
+    Blank lines inside the block are tolerated; any other trailing line means
+    the answer did not end in a question list.
+    """
     options: list[tuple[str, str]] = []
-    for line in reversed(lines):
-        match = CHOICE_RE.match(line)
-        if match:
-            options.append((match.group(1), match.group(2)))
-        elif options:
+    for line in reversed(text.rstrip().splitlines()):
+        if not line.strip():
+            if options:
+                continue
             break
+        match = CHOICE_RE.match(line)
+        if not match:
+            break
+        options.append((match.group(1), match.group(2)))
     options.reverse()
     if not (2 <= len(options) <= 8):
         return []
@@ -92,26 +147,22 @@ def choice_options(text: str) -> list[tuple[str, str]]:
     return options
 
 
-def clean_text(text: str) -> str:
-    return ANSI_RE.sub("", text).replace("\r\n", "\n").strip()
-
-
-def esc(text: str) -> str:
-    return html.escape(text, quote=False)
-
-
 def new_session(cwd: str) -> dict:
     return {
         "cwd": cwd,
+        "prev_cwd": None,
         "model": None,  # None means use omp CLI default configured model
+        "thinking": None,  # None means use omp's configured thinking level
         "omp_session_id": None,
         "proc": None,
         "stopped": False,
         "started_at": None,
         "busy": False,
+        "task": None,  # human label of the tracked subprocess, for /status
         "generation": 0,
         "lock": asyncio.Lock(),
         "choice": None,
+        "model_choice": None,
     }
 
 
@@ -123,6 +174,14 @@ def get_session(user_id: int) -> dict:
         start = DEFAULT_CWD if os.path.isdir(DEFAULT_CWD) else str(Path.home())
         USER_SESSIONS[user_id] = new_session(start)
     return USER_SESSIONS[user_id]
+
+
+def clear_choices(sess: dict) -> None:
+    """Drop every pending inline menu so stale buttons cannot act."""
+    sess["choice"] = None
+    sess["model_choice"] = None
+
+
 
 
 def is_authorized(user_id: int) -> bool:
@@ -176,7 +235,28 @@ def git_env() -> dict[str, str]:
     return env
 
 
-async def git(cwd: str, *args: str) -> tuple[int, str, str]:
+async def terminate(proc: asyncio.subprocess.Process) -> None:
+    """Signal the whole process group, escalating to SIGKILL after a grace period."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=2)
+            return
+        except asyncio.TimeoutError:
+            continue
+
+
+async def git(cwd: str, *args: str, timeout: float | None = None,
+              track: dict | None = None) -> tuple[int, str, str]:
+    """Run git in its own process group.
+
+    `track` publishes the handle on the session so `/stop` can terminate a
+    hanging push or pull; `timeout` bounds network operations that would
+    otherwise keep the session busy forever.
+    """
     try:
         proc = await asyncio.create_subprocess_exec(
             "git",
@@ -185,10 +265,24 @@ async def git(cwd: str, *args: str) -> tuple[int, str, str]:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=git_env(),
+            start_new_session=True,
         )
     except FileNotFoundError:
         return 127, "", "git executable not found"
-    out, err = await proc.communicate()
+    if track is not None:
+        track["proc"] = proc
+    try:
+        if timeout is None:
+            out, err = await proc.communicate()
+        else:
+            try:
+                out, err = await asyncio.wait_for(proc.communicate(), timeout)
+            except asyncio.TimeoutError:
+                await terminate(proc)
+                return -1, "", f"git {args[0]} timed out after {timeout:.0f}s"
+    finally:
+        if track is not None and track["proc"] is proc:
+            track["proc"] = None
     return proc.returncode, out.decode(errors="replace").strip(), err.decode(errors="replace").strip()
 
 
@@ -236,6 +330,10 @@ async def send_long(message, text: str, parse_mode: str | None = None, reply_mar
                 high = mid - 1
         cut = low
         if cut < len(text):
+            if parse_mode == ParseMode.HTML and text[:cut].count("```") % 2:
+                fence_start = text.rfind("```", 0, cut)
+                if fence_start > cut // 3:
+                    cut = fence_start
             boundary = text.rfind("\n", 0, cut)
             if boundary > cut // 2:
                 cut = boundary + 1
@@ -334,7 +432,8 @@ class StreamState:
     def render(self, elapsed: float) -> str:
         lines = [f"⏳ <b>Working</b> · {elapsed:.0f}s"]
         if self.tool_lines:
-            lines.append("🔧 Using tools" + (" · ⚠️ one failed" if any("failed" in line for line in self.tool_lines) else ""))
+            latest = self.tool_lines[-1]
+            lines.append(f"<code>{esc(latest)}</code>")
         return "\n".join(lines)
 
 
@@ -412,6 +511,9 @@ async def pump_stdout(proc: asyncio.subprocess.Process, state: StreamState, on_u
                 state.tool_lines.append(f"⚠️ {str(event.get('toolName', 'tool'))[:80]} failed")
                 del state.tool_lines[:-MAX_TOOL_LINES]
                 dirty = True
+        elif kind == "agent_end":
+            state.agent_end = event
+            dirty = True
 
         if not dirty:
             continue
@@ -426,6 +528,7 @@ async def run_omp(user_id: int, prompt: str, message, context: ContextTypes.DEFA
     generation = sess["generation"]
     session_id = sess["omp_session_id"]
     model = sess["model"]
+    thinking = sess["thinking"]
     chat_id = message.chat_id
     env = git_env()
     env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
@@ -437,6 +540,7 @@ async def run_omp(user_id: int, prompt: str, message, context: ContextTypes.DEFA
     state = StreamState()
     started = time.monotonic()
     sess["started_at"] = started
+    sess["task"] = "prompt"
     typing_stop = asyncio.Event()
     typing_task = asyncio.create_task(keep_typing(context, chat_id, typing_stop))
 
@@ -446,13 +550,15 @@ async def run_omp(user_id: int, prompt: str, message, context: ContextTypes.DEFA
         except Exception:
             pass
 
-    async def launch(resume: str | None, selected_model: str | None):
+    async def launch(resume: str | None, selected_model: str | None, selected_thinking: str | None):
         cmd = [OMP_BIN, "-p", "--auto-approve", "--mode", "json"]
         if selected_model:
             cmd += ["--model", selected_model]
+        if selected_thinking:
+            cmd += ["--thinking", selected_thinking]
         if resume:
             cmd += ["-r", resume]
-        cmd.append(prompt)
+        cmd.extend(["--", prompt])
         proc = await asyncio.create_subprocess_exec(
             *cmd, cwd=cwd, env=env, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, start_new_session=True,
@@ -480,18 +586,7 @@ async def run_omp(user_id: int, prompt: str, message, context: ContextTypes.DEFA
             return proc, stderr
         finally:
             if proc.returncode is None:
-                try:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=2)
-                except asyncio.TimeoutError:
-                    try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    await proc.wait()
+                await terminate(proc)
             if not stderr_task.done():
                 stderr_task.cancel()
             await asyncio.gather(stderr_task, return_exceptions=True)
@@ -501,7 +596,7 @@ async def run_omp(user_id: int, prompt: str, message, context: ContextTypes.DEFA
     proc = None
     stderr_bytes = b""
     try:
-        proc, stderr_bytes = await launch(session_id, model)
+        proc, stderr_bytes = await launch(session_id, model, thinking)
         error = stderr_bytes.decode(errors="replace").lower()
         resume_rejected = bool(re.search(r"session\s+.+?\s+not found", error))
         # A nonzero exit is not sufficient evidence for replay: work may have
@@ -510,12 +605,15 @@ async def run_omp(user_id: int, prompt: str, message, context: ContextTypes.DEFA
                 and not state.session_id and session_id and resume_rejected):
             logger.warning("Session %s resume rejected; retrying fresh", session_id)
             state = StreamState()
-            proc, stderr_bytes = await launch(None, model)
+            proc, stderr_bytes = await launch(None, model, thinking)
             error = stderr_bytes.decode(errors="replace").lower()
-        model_rejected = any(word in error for word in (
-            "unknown model", "invalid model", "model not found", "unsupported model",
-            "model is not available", "unrecognized model",
-        ))
+        model_rejected = (
+            bool(re.search(r'model\s+(?:".+?"\s+)?not found', error))
+            or any(word in error for word in (
+                "unknown model", "invalid model", "model not found", "unsupported model",
+                "model is not available", "unrecognized model",
+            ))
+        )
         if (proc.returncode != 0 and not sess["stopped"] and not state.events
                 and not state.session_id and model != FALLBACK_MODEL and model_rejected):
             logger.warning("Model %s rejected; falling back to %s", model, FALLBACK_MODEL)
@@ -529,7 +627,9 @@ async def run_omp(user_id: int, prompt: str, message, context: ContextTypes.DEFA
             except Exception:
                 pass
             if not sess["stopped"]:
-                proc, stderr_bytes = await launch(None, FALLBACK_MODEL)
+                proc, stderr_bytes = await launch(None, FALLBACK_MODEL, thinking)
+                if proc.returncode == 0:
+                    sess["model"] = FALLBACK_MODEL
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -541,6 +641,9 @@ async def run_omp(user_id: int, prompt: str, message, context: ContextTypes.DEFA
         await typing_task
         sess["proc"] = None
         sess["started_at"] = None
+        sess["task"] = None
+
+
 
     if generation == sess["generation"]:
         # Failed or interrupted runs must not restore stale session identities.
@@ -584,16 +687,21 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "",
         f"📂 <b>Working dir:</b> <code>{esc(sess['cwd'])}</code>",
         f"🌿 <b>Branch:</b> <code>{esc(branch)}</code>" if branch else "🌿 <b>Branch:</b> <i>n/a (not a git repo)</i>",
-        f"🧠 <b>Session:</b> <code>{esc(sess['omp_session_id'] or 'new')}</code>",
-        f"🧩 <b>Model:</b> <code>{esc(sess.get('model') or 'default')}</code>",
+        f"🧩 <b>Model:</b> <code>{esc(sess['model'] or 'default')}</code>",
+        f"🧠 <b>Thinking:</b> <code>{esc(sess['thinking'] or 'default')}</code>",
+        f"🗂 <b>Session:</b> <code>{esc(sess['omp_session_id'] or 'new')}</code>",
         "",
         "<b>Commands</b>",
-        "/model — show or switch the omp model",
-        "/cd &lt;path&gt; — change working directory",
-        "/pwd — current dir, branch, git status",
+        "/model [selector] — choose or reset the omp model",
+        "/thinking [level] — show or set thinking level",
+        "/cd &lt;path&gt; — change directory (use <code>/cd -</code> for previous)",
+        "/pwd — current directory, branch, and status",
+        "/diff [staged] — show working tree or staged diff",
+        "/log [n] — show recent commits",
         "/branch — list local/remote branches",
         "/checkout &lt;branch&gt; — switch to an existing branch",
-        "/push [remote] [branch] — push commits to the remote",
+        "/pull [remote] [branch] — fast-forward pull from remote",
+        "/push [remote] [branch] — push commits to remote",
         "/status — running task info",
         "/stop — abort the running task",
         "/reset — start a fresh omp session",
@@ -638,13 +746,19 @@ async def cmd_cd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if not context.args:
         await update.message.reply_text(
-            f"📂 <code>{esc(sess['cwd'])}</code>\nUsage: <code>/cd &lt;path&gt;</code>",
+            f"📂 <code>{esc(sess['cwd'])}</code>\n"
+            "Usage: <code>/cd &lt;path&gt;</code> · <code>/cd -</code> returns to the previous directory",
             parse_mode=ParseMode.HTML,
         )
         return
 
     target = " ".join(context.args)
-    if target.startswith("~"):
+    if target == "-":
+        if not sess["prev_cwd"]:
+            await update.message.reply_text("ℹ️ No previous working directory recorded.")
+            return
+        resolved = Path(sess["prev_cwd"])
+    elif target.startswith("~"):
         resolved = Path(os.path.expanduser(target))
     else:
         resolved = Path(target)
@@ -667,10 +781,13 @@ async def cmd_cd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    sess["cwd"] = str(resolved.resolve())
+    previous = sess["cwd"]
+    sess["cwd"] = str(resolved)
+    if previous != sess["cwd"]:
+        sess["prev_cwd"] = previous
     sess["omp_session_id"] = None  # sessions are scoped per working directory
     sess["generation"] += 1
-    sess["choice"] = None
+    clear_choices(sess)
 
     branch = await current_branch(sess["cwd"])
     suffix = f"\n🌿 <b>Branch:</b> <code>{esc(branch)}</code>" if branch else "\nℹ️ not a git repository"
@@ -684,6 +801,10 @@ async def cmd_branch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not allowed_update(update):
         return
     sess = get_session(update.effective_user.id)
+    code, _, _ = await git(sess["cwd"], "rev-parse", "--is-inside-work-tree")
+    if code != 0:
+        await update.message.reply_text("❌ Not a git repository.")
+        return
     code, out, err = await git(sess["cwd"], "branch", "-a", "--sort=-committerdate")
     if code != 0:
         await send_pre(update.message, f"❌ git error in <code>{esc(sess['cwd'])}</code>:\n", err or out)
@@ -706,10 +827,12 @@ async def cmd_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if await reject_busy(sess, update.message):
         return
     sess["busy"] = True
+    sess["task"] = "checkout"
     try:
         await perform_checkout(sess, context.args, update.message)
     finally:
         sess["busy"] = False
+        sess["task"] = None
 
 
 async def perform_checkout(sess: dict, args: list[str], message) -> None:
@@ -726,14 +849,15 @@ async def perform_checkout(sess: dict, args: list[str], message) -> None:
     if valid != 0:
         await message.reply_text("❌ Invalid branch name.")
         return
-    code, out, err = await git(sess["cwd"], "switch", "--no-guess", "--", branch)
+    code, out, err = await git(sess["cwd"], "switch", "--no-guess", "--", branch,
+                               track=sess, timeout=GIT_TIMEOUT)
     if code != 0:
         await send_pre(message, "❌ Checkout failed:\n", err or out)
         return
     branch = await current_branch(sess["cwd"])
     sess["omp_session_id"] = None
     sess["generation"] += 1
-    sess["choice"] = None
+    clear_choices(sess)
     detail = clean_text("\n".join(x for x in (out, err) if x))
     await send_pre(message, f"✅ <b>Branch:</b> <code>{esc(branch or '?')}</code>\n", detail)
 
@@ -787,7 +911,11 @@ async def perform_push(sess: dict, args: list[str], message) -> None:
         cmd = ["push", *flags, *([] if upstream_code == 0 else ["-u", "origin", branch])]
 
     status = await message.reply_text("⏳ Pushing...")
-    code, out, err = await git(cwd, *cmd)
+    sess["task"] = "push"
+    try:
+        code, out, err = await git(cwd, *cmd, track=sess, timeout=GIT_TIMEOUT)
+    finally:
+        sess["task"] = None
     detail = "\n".join(x for x in (out, err) if x) or "(no output)"
     try:
         await status.delete()
@@ -796,21 +924,155 @@ async def perform_push(sess: dict, args: list[str], message) -> None:
     await send_pre(message, "✅ <b>Push complete</b>\n" if code == 0 else "❌ <b>Push failed</b>\n", detail)
 
 
+async def cmd_diff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed_update(update):
+        return
+    sess = get_session(update.effective_user.id)
+    if await reject_busy(sess, update.message):
+        return
+    await perform_diff(sess, context.args or [], update.message)
+
+
+async def perform_diff(sess: dict, args: list[str], message) -> None:
+    cwd = sess["cwd"]
+    code, _, _ = await git(cwd, "rev-parse", "--is-inside-work-tree")
+    if code != 0:
+        await message.reply_text("❌ Not a git repository.")
+        return
+
+    staged = False
+    if args:
+        first = args[0].lower()
+        if first in {"staged", "--staged", "--cached"}:
+            staged = True
+        else:
+            await message.reply_text("Usage: <code>/diff [staged]</code>", parse_mode=ParseMode.HTML)
+            return
+
+    diff_target = ["--cached"] if staged else []
+    _, stat_out, _ = await git(cwd, "diff", "--stat", *diff_target)
+    diff_code, diff_out, err = await git(cwd, "diff", *diff_target)
+    if diff_code != 0:
+        await send_pre(message, "❌ <b>Diff error</b>\n", err or diff_out)
+        return
+
+    if not diff_out and not stat_out:
+        label = "staged changes" if staged else "unstaged changes"
+        await message.reply_text(f"ℹ️ No {label}.")
+        return
+
+    body = f"{stat_out}\n\n{diff_out}".strip()
+    if len(body) > DIFF_LIMIT:
+        body = body[:DIFF_LIMIT] + "\n... (truncated)"
+    heading = f"📝 <b>Diff ({'staged' if staged else 'working tree'})</b>\n"
+    await send_pre(message, heading, body)
+
+
+async def cmd_log(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed_update(update):
+        return
+    sess = get_session(update.effective_user.id)
+    if await reject_busy(sess, update.message):
+        return
+    cwd = sess["cwd"]
+    code, _, _ = await git(cwd, "rev-parse", "--is-inside-work-tree")
+    if code != 0:
+        await update.message.reply_text("❌ Not a git repository.")
+        return
+
+    count = LOG_DEFAULT
+    if context.args:
+        try:
+            count = int(context.args[0])
+            if count < 1:
+                count = LOG_DEFAULT
+            elif count > LOG_MAX:
+                count = LOG_MAX
+        except ValueError:
+            await update.message.reply_text(
+                f"Usage: <code>/log [1-{LOG_MAX}]</code>", parse_mode=ParseMode.HTML
+            )
+            return
+
+    code, out, err = await git(cwd, "log", "--oneline", f"-n{count}")
+    if code != 0:
+        await send_pre(update.message, "❌ <b>Log error</b>\n", err or out)
+        return
+    await send_pre(update.message, f"📜 <b>Git Log (last {count})</b>\n", out or "(no commits)")
+
+PULL_FLAGS = {"--ff-only", "--rebase", "--no-rebase"}
+
+
+async def cmd_pull(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed_update(update):
+        return
+    sess = get_session(update.effective_user.id)
+    if await reject_busy(sess, update.message):
+        return
+    sess["busy"] = True
+    try:
+        await perform_pull(sess, context.args or [], update.message)
+    finally:
+        sess["busy"] = False
+
+
+async def perform_pull(sess: dict, args: list[str], message) -> None:
+    cwd = sess["cwd"]
+    code, _, _ = await git(cwd, "rev-parse", "--is-inside-work-tree")
+    if code != 0:
+        await message.reply_text("❌ Not a git repository.")
+        return
+
+    flags: list[str] = []
+    targets: list[str] = []
+    for arg in args:
+        if arg in PULL_FLAGS:
+            flags.append(arg)
+        elif not arg.startswith("-") and PUSH_REF_RE.match(arg):
+            targets.append(arg)
+        else:
+            await message.reply_text(
+                f"❌ Unsupported argument: <code>{esc(arg)}</code>\n"
+                "Usage: <code>/pull [remote] [branch] [--ff-only|--rebase|--no-rebase]</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+    if not any(f in flags for f in ("--ff-only", "--rebase", "--no-rebase")):
+        flags.append("--ff-only")
+
+    status = await message.reply_text("⏳ Pulling...")
+    sess["task"] = "pull"
+    try:
+        code, out, err = await git(cwd, "pull", *flags, *targets, track=sess, timeout=GIT_TIMEOUT)
+    finally:
+        sess["task"] = None
+    detail = "\n".join(x for x in (out, err) if x) or "(no output)"
+    try:
+        await status.delete()
+    except Exception:
+        pass
+    await send_pre(message, "✅ <b>Pull complete</b>\n" if code == 0 else "❌ <b>Pull failed</b>\n", detail)
+
+
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed_update(update):
         return
     sess = get_session(update.effective_user.id)
     proc = sess["proc"]
-    if proc and proc.returncode is None:
+    if sess["busy"] or (proc is not None and proc.returncode is None):
         elapsed = time.monotonic() - (sess["started_at"] or time.monotonic())
         await update.message.reply_text(
-            f"⏳ omp running for {elapsed:.0f}s in <code>{esc(sess['cwd'])}</code>",
+            f"⏳ <b>{esc(sess['task'] or 'task')}</b> running for {elapsed:.0f}s in "
+            f"<code>{esc(sess['cwd'])}</code>",
             parse_mode=ParseMode.HTML,
         )
         return
     await update.message.reply_text(
         f"💤 Idle.\n📂 <code>{esc(sess['cwd'])}</code>\n"
-        f"🧠 session <code>{esc(sess['omp_session_id'] or 'new')}</code>",
+        f"🧩 <b>Model:</b> <code>{esc(sess['model'] or 'default')}</code>\n"
+        f"🧠 <b>Thinking:</b> <code>{esc(sess['thinking'] or 'default')}</code>\n"
+        f"🗂 <b>Session:</b> <code>{esc(sess['omp_session_id'] or 'new')}</code>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -820,26 +1082,19 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     sess = get_session(update.effective_user.id)
     proc = sess["proc"]
-    if not sess["busy"]:
+    if not sess["busy"] and (proc is None or proc.returncode is not None):
         await update.message.reply_text("ℹ️ No task is running.")
         return
     sess["stopped"] = True
     sess["generation"] += 1
     sess["omp_session_id"] = None
-    sess["choice"] = None
+    clear_choices(sess)
     if proc is None or proc.returncode is not None:
         await update.message.reply_text("🛑 Task cancelled.")
         return
     try:
-        os.killpg(proc.pid, signal.SIGTERM)
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=2)
-        except asyncio.TimeoutError:
-            os.killpg(proc.pid, signal.SIGKILL)
-            await proc.wait()
+        await terminate(proc)
         await update.message.reply_text("🛑 Task terminated.")
-    except ProcessLookupError:
-        await update.message.reply_text("ℹ️ Process already exited.")
     except Exception as exc:
         await update.message.reply_text(f"⚠️ Stop failed: {esc(str(exc))}", parse_mode=ParseMode.HTML)
 
@@ -852,8 +1107,37 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     sess["omp_session_id"] = None
     sess["generation"] += 1
-    sess["choice"] = None
+    clear_choices(sess)
     await update.message.reply_text("🔄 Session cleared. Next message starts a fresh omp session.")
+
+def apply_model(sess: dict, model: str | None) -> None:
+    """Switch the active selector and invalidate the session bound to the old one."""
+    sess["model"] = model
+    sess["omp_session_id"] = None
+    sess["generation"] += 1
+    clear_choices(sess)
+
+
+def model_set_text(sess: dict) -> str:
+    return (
+        f"✅ <b>Model set:</b> <code>{esc(sess['model'])}</code>\n"
+        f"↩️ Falls back to <code>{esc(FALLBACK_MODEL)}</code> if it fails.\n"
+        "🧠 Session cleared so the new model starts clean."
+    )
+
+
+def model_menu(sess: dict, chat_id: int, selectors: list[str]):
+    """First page of the inline model picker, or None when the catalog is empty."""
+    if not selectors:
+        return None
+    page = selectors[:MODEL_PAGE_SIZE]
+    token = secrets.token_urlsafe(12)
+    sess["model_choice"] = (token, chat_id, {str(index): selector for index, selector in enumerate(page)})
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(selector[:55], callback_data=f"model:{token}:{index}")]
+        for index, selector in enumerate(page)
+    ])
+
 
 async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed_update(update):
@@ -863,25 +1147,22 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if not context.args:
-        current = sess.get("model") or "default"
         models = await fetch_available_models()
         selectors = [m["selector"] for m in models if m.get("selector")]
-        listing = "\n".join(f"• <code>{esc(s)}</code>" for s in selectors[:40])
+        listing = "\n".join(f"• <code>{esc(selector)}</code>" for selector in selectors[:40])
         await update.message.reply_text(
-            f"🧩 <b>Model:</b> <code>{esc(current)}</code>\n"
+            f"🧩 <b>Model:</b> <code>{esc(sess['model'] or 'default')}</code>\n"
             f"↩️ Fallback on failure: <code>{esc(FALLBACK_MODEL)}</code>\n\n"
             f"<b>Available</b>\n{listing or '<i>catalog unavailable</i>'}\n\n"
             "Usage: <code>/model &lt;selector&gt;</code> · <code>/model default</code> to reset",
             parse_mode=ParseMode.HTML,
+            reply_markup=model_menu(sess, update.message.chat_id, selectors),
         )
         return
 
     choice = " ".join(context.args).strip()
     if choice.lower() in {"default", "reset", "clear", "auto"}:
-        sess["model"] = None
-        sess["omp_session_id"] = None
-        sess["choice"] = None
-        sess["generation"] += 1
+        apply_model(sess, None)
         await update.message.reply_text(
             "✅ Model reset to omp default; session cleared.", parse_mode=ParseMode.HTML
         )
@@ -903,14 +1184,44 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     # Catalog unavailable: still let omp attempt the value (it does fuzzy matching itself).
-    sess["model"] = match or choice
-    sess["omp_session_id"] = None  # model switch invalidates session context
+    apply_model(sess, match or choice)
+    await update.message.reply_text(model_set_text(sess), parse_mode=ParseMode.HTML)
+
+
+async def cmd_thinking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed_update(update):
+        return
+    sess = get_session(update.effective_user.id)
+    levels = " · ".join(f"<code>{level}</code>" for level in THINKING_LEVELS)
+    if not context.args:
+        await update.message.reply_text(
+            f"🧠 <b>Thinking level:</b> <code>{esc(sess['thinking'] or 'default')}</code>\n"
+            f"Levels: {levels}\n"
+            "Usage: <code>/thinking &lt;level&gt;</code> · <code>/thinking default</code> to reset",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if await reject_busy(sess, update.message):
+        return
+
+    choice = context.args[0].strip().lower()
+    if choice in {"default", "reset", "clear", "none"}:
+        sess["thinking"] = None
+    elif choice in THINKING_LEVELS:
+        sess["thinking"] = choice
+    else:
+        await update.message.reply_text(
+            f"❌ Unknown thinking level <code>{esc(choice)}</code>.\nLevels: {levels}",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    sess["omp_session_id"] = None
     sess["generation"] += 1
-    sess["choice"] = None
+    clear_choices(sess)
     await update.message.reply_text(
-        f"✅ <b>Model set:</b> <code>{esc(sess['model'])}</code>\n"
-        f"↩️ Falls back to <code>{esc(FALLBACK_MODEL)}</code> if it fails.\n"
-        "🧠 Session cleared so the new model starts clean.",
+        f"✅ <b>Thinking level:</b> <code>{esc(sess['thinking'] or 'default')}</code>\n"
+        "🧠 Session cleared so the new level starts clean.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -931,7 +1242,7 @@ async def on_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     sess["busy"] = True
     sess["stopped"] = False
-    sess["choice"] = None
+    clear_choices(sess)
     try:
         async with sess["lock"]:
             await run_omp(user_id, prompt, update.message, context)
@@ -961,7 +1272,7 @@ async def on_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     sess["busy"] = True
     sess["stopped"] = False
-    sess["choice"] = None
+    clear_choices(sess)
     await query.answer()
     try:
         async with sess["lock"]:
@@ -974,6 +1285,32 @@ async def on_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     finally:
         sess["busy"] = False
 
+async def on_model_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not allowed_update(update):
+        await query.answer("Unauthorized", show_alert=True)
+        return
+    sess = get_session(update.effective_user.id)
+    menu = sess.get("model_choice")
+    parts = (query.data or "").split(":")
+    if (len(parts) != 3 or not menu or parts[1] != menu[0]
+            or query.message.chat_id != menu[1] or parts[2] not in menu[2]):
+        await query.answer("This menu has expired.", show_alert=True)
+        return
+    if sess["busy"]:
+        await query.answer("A task is still running.", show_alert=True)
+        return
+    selector = menu[2][parts[2]]
+    sess["model_choice"] = None
+    apply_model(sess, selector)
+    await query.answer()
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await query.message.reply_text(model_set_text(sess), parse_mode=ParseMode.HTML)
+
+
 async def post_init(application: Application) -> None:
     await application.bot.set_my_commands(
         [
@@ -982,8 +1319,12 @@ async def post_init(application: Application) -> None:
             BotCommand("pwd", "Current directory, branch, git status"),
             BotCommand("branch", "List git branches"),
             BotCommand("checkout", "Switch to an existing git branch"),
+            BotCommand("diff", "Show working tree or staged diff"),
+            BotCommand("log", "Show recent commits"),
+            BotCommand("pull", "Pull commits from the remote"),
             BotCommand("push", "Push commits to the remote"),
             BotCommand("model", "Show or switch the omp model"),
+            BotCommand("thinking", "Show or set the omp thinking level"),
             BotCommand("status", "Show running task"),
             BotCommand("stop", "Abort running task"),
             BotCommand("reset", "Start a fresh omp session"),
@@ -1007,12 +1348,17 @@ def main() -> None:
     app.add_handler(CommandHandler("pwd", cmd_pwd))
     app.add_handler(CommandHandler("branch", cmd_branch))
     app.add_handler(CommandHandler("checkout", cmd_checkout))
+    app.add_handler(CommandHandler("diff", cmd_diff))
+    app.add_handler(CommandHandler("log", cmd_log))
+    app.add_handler(CommandHandler("pull", cmd_pull))
     app.add_handler(CommandHandler("push", cmd_push))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("model", cmd_model))
+    app.add_handler(CommandHandler("thinking", cmd_thinking))
     app.add_handler(CallbackQueryHandler(on_choice, pattern=r"^choice:"))
+    app.add_handler(CallbackQueryHandler(on_model_choice, pattern=r"^model:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_prompt))
 
     app.run_polling(drop_pending_updates=True)

@@ -7,32 +7,36 @@ An interactive Telegram bot that exposes the **`omp` (Oh My Pi)** agentic coding
 ## Features
 
 - 🚀 **Full OMP CLI Access**: Run agentic coding tasks, shell commands, file edits, and codebase questions directly through Telegram.
-- 📂 **Directory Navigation**: Use `/cd` within the configured workspace boundary; host runs without a boundary do not restrict navigation.
-- 🌿 **Git Branch & Push Management**: Inspect changes with `/pwd`, list branches with `/branch`, switch branches with `/checkout <branch>`, and push commits directly with `/push`.
-- 🧩 **Model Switching**: Select a model with `/model <name>` or restore the CLI default with `/model default`; model changes start a fresh session. `FALLBACK_MODEL` identifies a configured alternative but failed work is not automatically replayed.
-- 🛑 **Task Cancellation**: `/stop` requests termination of the active OMP process group. A stopped task is not retried.
+- 📂 **Directory Navigation**: Use `/cd <path>` within the configured workspace boundary, or `/cd -` to return to the previous working directory; host runs without a boundary do not restrict navigation.
+- 🌿 **Git Workspace & History**: Inspect status with `/pwd`, view recent commits with `/log [n]`, view unstaged or staged diffs with `/diff [staged]`, list branches with `/branch`, switch branches with `/checkout <branch>`, fast-forward pull from remotes with `/pull`, and push commits with `/push`.
+- 🧩 **Model & Thinking Control**: Select a model via `/model` with an interactive inline button picker or `/model <selector>`, restore CLI default with `/model default`, and tune reasoning depth with `/thinking [level]`. Model and thinking changes start a fresh session cleanly.
+- 🛑 **Task Cancellation**: `/stop` requests immediate termination of the active OMP or Git process group. A stopped task is not retried.
 - 🔄 **Session Continuity**: Prompts resume the current OMP session; `/reset` clears the session ID.
 - ⚡ **Progress Streaming**: Throttled status messages summarize activity without exposing raw reasoning or tool arguments.
 - 💬 **Readable Replies & Choices**: Completed numbered choices may appear as inline buttons that submit a follow-up turn; stale buttons do not run a task.
 - 🛡️ **Access Control**: Only the configured numeric user ID in a private chat may control the bot. This does not sandbox OMP from files reachable by the service account.
 - 🐳 **Docker-Ready**: Packaged with Docker Compose for single-command deployment with host user UID/GID mapping and volume mounts.
-
 ---
 
 ## Commands
 
 | Command | Description |
 |---|---|
-| `/start`, `/help` | Bot overview, current directory, active branch, session ID, and command menu |
-| `/model` | Show current model, available catalog models, and fallback model |
+| `/start`, `/help` | Bot overview, current directory, active branch, session ID, model, thinking level, and command menu |
+| `/model` | Show current model, available catalog models, and fallback model with an interactive inline keyboard picker |
 | `/model <selector>` | Switch model (e.g. `/model Coding`, `/model openai-codex/gpt-5.6-luna`), or `/model default` |
+| `/thinking` | Show current thinking level and available levels (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `auto`) |
+| `/thinking <level>` | Set agent thinking level, or `/thinking default` to reset |
 | `/pwd` | Active directory, branch, and concise Git status |
-| `/cd <path>` | Switch directory within the configured workspace boundary (relative or absolute path); starts a fresh session |
-| `/branch` | List local and remote branches |
+| `/cd <path>` | Switch directory within the configured workspace boundary (relative or absolute path); `/cd -` returns to previous directory; starts a fresh session |
+| `/diff [staged]` | View working tree diff (with `--stat` summary) or staged changes |
+| `/log [n]` | View recent one-line commits (default 10, max 50) |
+| `/branch` | List local and remote branches sorted by committer date |
 | `/checkout <branch>` | Switch to an existing branch; does not fetch remotes or create branches; starts a fresh session |
+| `/pull [remote] [branch]` | Fast-forward pull commits from the remote repository (`--ff-only` by default) |
 | `/push [remote] [branch]` | Push commits to the remote repository (auto-detects upstream or sets `-u origin <branch>`) |
-| `/status` | Show active task, elapsed time, and session ID |
-| `/stop` | Terminate the active task, even while a prompt is running |
+| `/status` | Show active task name, elapsed time, and session ID (or idle status with model and thinking settings) |
+| `/stop` | Terminate the active task process group, even while a prompt or git network operation is running |
 | `/reset` | Start a fresh OMP session |
 | `<Any text prompt>` | Run `omp -p --auto-approve --mode json` in the active directory |
 
@@ -139,7 +143,7 @@ journalctl -u omp-bot -f
 
 Edit the unit's `User`, `WorkingDirectory`, `EnvironmentFile`, and `ExecStart` paths before enabling it. Ensure `.env` is owned by and readable only by the service user (`chmod 600 .env`), and the OMP executable and credentials are available to that same user. The unit uses `KillMode=control-group` so stopping the service terminates spawned tasks. Keep only one polling instance per token; stop the previous instance before switching between Compose and systemd. A restart clears in-memory bot session selections, and an interrupted OMP task is not automatically resumed.
 
-While a task runs, `/stop` remains available; directory, model, branch, and session changes are rejected until the run ends. Failed tasks are not blindly replayed after possible side effects: inspect the workspace and decide whether to send a new prompt. `/checkout` changes to an existing branch without fetching; fetch updates separately in your workspace if needed. Inline choice buttons are follow-up turns, not interactive stdin to an in-progress process.
+While a task runs, `/stop` remains available; directory, model, thinking-level, branch, and session changes are rejected until the run ends. Failed tasks are not blindly replayed after possible side effects: inspect the workspace and decide whether to send a new prompt. `/checkout` changes to an existing branch without fetching; `/pull` defaults to `--ff-only` and `/push` auto-detects upstream, so fetch or rebase explicitly in your workspace when history has diverged. Inline choice buttons are follow-up turns, not interactive stdin to an in-progress process.
 
 > **Important:** Run one polling instance per token (Docker **or** systemd, not both); concurrent polling produces Telegram `409 Conflict` errors.
 

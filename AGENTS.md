@@ -14,15 +14,15 @@ Telegram User (ID whitelist)
    bot.py Application (python-telegram-bot v22+, asyncio)
         │
         ├── Session State Router (per authorized user_id)
-        │       ├── Working Directory (cwd)
-        │       ├── Active Model Selector
+        │       ├── Working Directory (cwd, prev_cwd)
+        │       ├── Active Model Selector & Thinking Level
         │       └── Resumed OMP Session ID
         │
-        ├── Command Dispatcher (/cd, /pwd, /branch, /checkout, /model, /stop, /reset)
+        ├── Command Dispatcher (/cd, /pwd, /diff, /log, /branch, /checkout, /pull, /push, /model, /thinking, /status, /stop, /reset)
         │
         └── Prompt Runner (run_omp)
                 │
-                ├── Subprocess: omp -p --auto-approve --mode json [-r session_id] [--model model] "<prompt>"
+                ├── Subprocess: omp -p --auto-approve --mode json [-r session_id] [--model model] [--thinking thinking] -- "<prompt>"
                 │
                 ├── pump_stdout() parses JSONL events → StreamState
                 │        └── throttled status edit (1.5s) + typing action
@@ -41,17 +41,21 @@ Telegram User (ID whitelist)
 | Field | Type | Meaning |
 |---|---|---|
 | `cwd` | `str` | Active working directory for all omp + git subprocesses |
+| `prev_cwd` | `str \| None` | Previous working directory for `/cd -` return |
 | `model` | `str \| None` | Custom model selector; `None` uses omp default |
+| `thinking` | `str \| None` | Custom thinking level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `auto`); `None` uses omp default |
 | `omp_session_id` | `str \| None` | Resumed omp session ID; `None` starts a fresh session |
-| `proc` | `Process \| None` | Currently running omp subprocess handle |
+| `proc` | `Process \| None` | Currently running omp or git subprocess handle |
 | `stopped` | `bool` | Flag set by `/stop` for cancellation |
 | `started_at` | `float \| None` | `time.monotonic()` start stamp of the running task |
 | `lock` | `asyncio.Lock` | Serializes one omp task per user |
-| `busy` | `bool` | Set by `/push`, `/checkout`, and prompt runs; context-changing commands reject while true |
+| `busy` | `bool` | Set by prompt runs, `/push`, `/pull`, and `/checkout`; context-changing commands reject while true |
+| `task` | `str \| None` | Human-readable label of the active tracked task for `/status` |
 | `generation` | `int` | Incremented on every context reset; invalidates stale inline-choice tokens |
-| `choice` | `dict \| None` | Pending inline numbered-choice token for the current generation |
+| `choice` | `tuple \| None` | Pending inline numbered-choice token tuple `(token, chat_id, session_id, options)` |
+| `model_choice` | `tuple \| None` | Pending inline model menu token tuple `(token, chat_id, options)` |
 
-**Reset semantics**: `/cd`, `/checkout`, and `/model` selection (including `default`) clear `omp_session_id` and bump `generation`. Context-changing commands are rejected during an active task; `/stop` remains available concurrently. `/push` does not change session context.
+**Reset semantics**: `/cd`, `/checkout`, `/model` selection (including `default`), and `/thinking` clear `omp_session_id`, bump `generation`, and clear all pending choice and model menus via `clear_choices()`. Context-changing commands are rejected during an active task; `/stop` remains available concurrently. Git operations (`/push`, `/pull`, `/diff`, `/log`) do not reset session context.
 
 **Failure semantics**: Do not automatically replay failed work after possible tool side effects; report failure so the user can inspect the workspace and decide whether to retry.
 
@@ -70,7 +74,9 @@ Telegram User (ID whitelist)
 | `tool_execution_end` (`isError`) | Append `⚠️ <tool> failed` marker |
 | `agent_end` | Authoritative final assistant text source |
 
-Final answers escape untrusted HTML and render paired `**bold**` as Telegram HTML bold. A completed answer ending in a contiguous numbered list (1–8, two or more choices) receives inline buttons; callbacks authorize the user, validate an opaque per-session token and chat, and resume OMP with the selected number. The `-p` subprocess does not accept interactive stdin: choices are a subsequent session turn, not an interruption of a running task. Progress shows elapsed time and tool activity without raw thinking or tool arguments.
+Final answers escape untrusted HTML, then render fenced code blocks (with a sanitized `language-*` class), inline `` `code` `` spans, and paired `**bold**` runs. Bold markers must hug non-space text and may not straddle another `**` pair, so `2 ** 3` and `**kwargs` stay literal. An unclosed fence is closed at the end of the message so truncated output still renders as code. A completed answer ending in a contiguous numbered list (1–8, two or more choices) receives inline buttons; callbacks authorize the user, validate an opaque per-session token and chat, and resume OMP with the selected number. The `-p` subprocess does not accept interactive stdin: choices are a subsequent session turn, not an interruption of a running task. Progress shows elapsed time and tool activity without raw thinking or tool arguments.
+
+Inline model menus use the same token discipline under the `model:` callback prefix: `model_menu()` stores `(token, chat_id, {index: selector})` in `model_choice`, and `on_model_choice()` rejects expired or foreign-chat callbacks before switching the selector.
 
 Tool summary line format: `🔧 <toolName>: <command|path|pattern|query|url|intent>` truncated to 120 chars.
 
@@ -80,19 +86,26 @@ Tool summary line format: `🔧 <toolName>: <command|path|pattern|query|url|inte
 
 | Command | Agent Behavior |
 |---|---|
-| `/start`, `/help` | Report cwd, branch, session id, active model, and full command menu |
+| `/start`, `/help` | Report cwd, branch, session id, active model, thinking level, and full command menu |
 | `/pwd` | `git rev-parse --is-inside-work-tree`, `branch --show-current`, `status -sb` |
-| `/cd <path>` | Resolve path within configured workspace boundary when set; validate directory, set cwd, clear session |
-| `/branch` | List local and remote branches |
+| `/cd <path>` | Resolve path within configured workspace boundary when set; validate directory, set cwd, update prev_cwd, clear session |
+| `/cd -` | Switch back to the previous working directory (`prev_cwd`) and clear session |
+| `/diff [staged]` | Working tree or staged diff with `--stat` summary; truncated at 12,000 characters |
+| `/log [n]` | Show last `n` commits (1–50, default 10) in `--oneline` format |
+| `/branch` | List local and remote branches sorted by committer date |
 | `/checkout <branch>` | Checkout an existing branch without unconditional fetch; clear session |
-| `/push [remote] [branch]` | Push commits to the remote repository (auto-detects upstream or sets `-u origin <branch>`); batches authentication |
-| `/model` | List available models, show active selection and configured fallback |
+| `/pull [remote] [branch]` | Fast-forward pull commits from remote (`--ff-only` default, supports `--rebase` / `--no-rebase`); tracked for `/stop` |
+| `/push [remote] [branch]` | Push commits to the remote repository (auto-detects upstream or sets `-u origin <branch>`); batches authentication; tracked for `/stop` |
+| `/model` | List available models, show active selection and configured fallback; presents inline keyboard picker |
 | `/model <choice>` | Switch active model selector and clear session |
-| `/model default` | Reset model selector and clear session |
-| `/status` | Idle vs running (with elapsed time), cwd, session id, active model |
-| `/stop` | Terminate the active OMP process group even while a prompt is running |
-| `/reset` | Clear `omp_session_id` |
-| `<plain text>` | Run `omp -p --auto-approve --mode json` in cwd |
+| `/model default` | Reset model selector to CLI default and clear session |
+| `/thinking` | Show active thinking level and list available levels |
+| `/thinking <level>` | Set thinking level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `auto`) and clear session |
+| `/thinking default` | Reset thinking level to CLI default and clear session |
+| `/status` | Idle (with cwd, branch, model, thinking, session id) vs running task (with task name and elapsed time) |
+| `/stop` | Terminate the active OMP or Git process group even while a task is running |
+| `/reset` | Clear `omp_session_id` and all pending inline menus |
+| `<plain text>` | Run `omp -p --auto-approve --mode json` in cwd with active model and thinking flags |
 
 ---
 
@@ -102,8 +115,9 @@ Tool summary line format: `🔧 <toolName>: <command|path|pattern|query|url|inte
 - **Authorization first**: Require a decimal numeric configured user ID and a matching private chat before subprocesses run.
 - **Secret isolation**: No credentials in tracked files or Docker build context; runtime credentials remain accessible to OMP.
 - **No blind retry**: Non-zero exits do not trigger automatic replay of potentially side-effecting tasks.
-- **Output sanitization**: Escape untrusted HTML and chunk Telegram messages within limits.
-- **Process group isolation**: `start_new_session=True` allows `/stop` to terminate descendants.
+- **Output sanitization**: Escape untrusted HTML and chunk Telegram messages within limits; fences, inline code, and bold are rendered from escaped text only.
+- **Process group isolation**: `start_new_session=True` allows `/stop` to terminate descendants; `terminate()` sends SIGTERM to the group and escalates to SIGKILL after a 2-second grace period.
+- **Bounded Git network operations**: `/push`, `/pull`, and `/checkout` run with `GIT_TIMEOUT` (180s) and `track=sess`, so a hung remote cannot hold the session busy forever and `/stop` can abort it.
 - **Stream parsing**: Bytearray chunked buffer handles tool payloads >64KB safely.
 - **GitHub authority via environment**: `git_env()` injects `GITHUB_TOKEN`, commit identity, `GIT_TERMINAL_PROMPT=0`, and `GIT_SSH_COMMAND="ssh -o BatchMode=yes"` through `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` so credentials never touch disk; the same environment is passed to every `git()` call and to the `omp` subprocess.
 
