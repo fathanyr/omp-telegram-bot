@@ -35,6 +35,7 @@ The **OMP Telegram Bot** is a secure, interactive interface bridging the Telegra
 - `/stop`: Aborts any running task immediately via `SIGTERM` followed by `SIGKILL` and process-group cleanup (`pkill -9 -g <pgid>`).
 - `/reset`: Clears the session identifier, forcing the next prompt to start a fresh agent session.
 - **Session Continuity**: Multi-turn conversation context is automatically preserved across prompts in the same directory using `-r <session_id>`.
+- **Readable interaction**: Render paired `**bold**` from OMP as escaped Telegram HTML; show compact status without raw thinking/tool arguments. Completed numbered-choice questions offer authorized inline buttons that submit the selected number as a follow-up session turn. Stale choices must not launch a subprocess.
 
 ---
 

@@ -14,14 +14,16 @@ import os
 import re
 import signal
 import subprocess
+import secrets
 import time
 from pathlib import Path
 
 from dotenv import load_dotenv
-from telegram import BotCommand, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -47,6 +49,32 @@ MAX_TOOL_LINES = 8
 FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "openai-codex/gpt-5.6-luna")
 
 ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+CHOICE_RE = re.compile(r"^\s*(\d{1,2})[.)]\s+(.+?)\s*$")
+BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+
+def format_answer(text: str) -> str:
+    """Escape untrusted output, then translate paired Markdown bold to Telegram HTML."""
+    parts = BOLD_RE.split(text)
+    return "".join(f"<b>{esc(part)}</b>" if index % 2 else esc(part)
+                   for index, part in enumerate(parts))
+
+
+def choice_options(text: str) -> list[tuple[str, str]]:
+    """Only offer buttons for a final, contiguous numbered question block."""
+    lines = text.rstrip().splitlines()
+    options: list[tuple[str, str]] = []
+    for line in reversed(lines):
+        match = CHOICE_RE.match(line)
+        if match:
+            options.append((match.group(1), match.group(2)))
+        elif options:
+            break
+    options.reverse()
+    if not (2 <= len(options) <= 8):
+        return []
+    if [int(number) for number, _ in options] != list(range(1, len(options) + 1)):
+        return []
+    return options
 
 
 def clean_text(text: str) -> str:
@@ -66,6 +94,7 @@ def new_session(cwd: str) -> dict:
         "stopped": False,
         "started_at": None,
         "lock": asyncio.Lock(),
+        "choice": None,
     }
 
 
@@ -125,20 +154,30 @@ async def fetch_available_models() -> list[dict]:
     return []
 
 
-async def send_long(message, text: str, parse_mode: str | None = None) -> None:
-    """Send text, splitting on line boundaries to stay under Telegram's limit."""
+async def send_long(message, text: str, parse_mode: str | None = None, reply_markup=None) -> None:
+    """Split untrusted text before escaping; preserve bold pairs across chunks."""
     text = clean_text(text)
     if not text:
         return
+    chunks = []
     while text:
-        if len(text) <= TG_LIMIT:
-            chunk, text = text, ""
-        else:
-            cut = text.rfind("\n", 0, TG_LIMIT)
-            if cut < TG_LIMIT // 2:
-                cut = TG_LIMIT
-            chunk, text = text[:cut], text[cut:]
-        await message.reply_text(chunk, parse_mode=parse_mode)
+        cut = min(len(text), TG_LIMIT // 2 if parse_mode == ParseMode.HTML else TG_LIMIT)
+        if cut < len(text):
+            boundary = text.rfind("\n", 0, cut)
+            if boundary > cut // 2:
+                cut = boundary + 1
+            if parse_mode == ParseMode.HTML and text[:cut].count("**") % 2:
+                boundary = text.rfind("**", 0, cut)
+                if boundary > 0:
+                    cut = boundary
+        chunks.append(text[:cut])
+        text = text[cut:]
+    for index, part in enumerate(chunks):
+        await message.reply_text(
+            format_answer(part) if parse_mode == ParseMode.HTML else part,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup if index == len(chunks) - 1 else None,
+        )
 
 
 async def keep_typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int, stop: asyncio.Event) -> None:
@@ -206,19 +245,10 @@ class StreamState:
         self.events: list[dict] = []
 
     def render(self, elapsed: float) -> str:
-        lines = [f"⏳ <b>Running omp</b> ({elapsed:.0f}s)"]
-        if self.thinking:
-            snippet = " ".join(self.thinking.split())
-            if len(snippet) > 160:
-                snippet = snippet[:157] + "..."
-            lines.append(f"🧠 <i>{esc(snippet)}</i>")
+        lines = [f"⏳ <b>Working</b> · {elapsed:.0f}s"]
         if self.tool_lines:
-            lines.append("")
-            lines.extend(esc(line) for line in self.tool_lines[-MAX_TOOL_LINES:])
-        if self.text:
-            lines.append("")
-            lines.append(esc(self.text[-400:]))
-        return "\n".join(lines)[:TG_LIMIT]
+            lines.append("🔧 Using tools" + (" · ⚠️ one failed" if any("failed" in line for line in self.tool_lines) else ""))
+        return "\n".join(lines)
 
 
 async def iter_json_lines(stream: asyncio.StreamReader):
@@ -295,18 +325,16 @@ async def pump_stdout(proc: asyncio.subprocess.Process, state: StreamState, on_u
             state.last_edit = now
             await on_update()
 
-
-async def run_omp(user_id: int, prompt: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def run_omp(user_id: int, prompt: str, message, context: ContextTypes.DEFAULT_TYPE) -> None:
     sess = get_session(user_id)
-    chat_id = update.effective_chat.id
     cwd = sess["cwd"]
-
+    chat_id = message.chat_id
 
     env = os.environ.copy()
     env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
     env["PATH"] = f"{Path(OMP_BIN).parent}:{Path.home()}/.local/bin:{env['PATH']}"
 
-    status = await update.message.reply_text("⏳ Starting omp...")
+    status = await message.reply_text("⏳ Working...")
     state = StreamState()
     started = time.monotonic()
     sess["started_at"] = started
@@ -401,20 +429,25 @@ async def run_omp(user_id: int, prompt: str, update: Update, context: ContextTyp
     except Exception:
         pass
 
-    model_label = used_model or "default"
-    fallback_note = " (fallback)" if fallback_used else ""
-    header = (
-        f"📂 <code>{esc(cwd)}</code> · 🧩 <code>{esc(model_label)}</code>{fallback_note}"
-        f" · ⏱ {elapsed:.0f}s · exit {proc.returncode}"
-    )
-    await update.message.reply_text(header, parse_mode=ParseMode.HTML)
-
     if answer:
-        await send_long(update.message, answer)
-    elif stderr_text:
-        await send_long(update.message, f"⚠️ omp produced no output.\n\n{stderr_text}")
+        options = choice_options(answer)
+        markup = None
+        if options and proc.returncode == 0 and not sess["stopped"] and sess["omp_session_id"]:
+            token = secrets.token_urlsafe(12)
+            sess["choice"] = (token, chat_id, sess["omp_session_id"], {number: label for number, label in options})
+            markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{number}. {label[:55]}", callback_data=f"choice:{token}:{number}")]
+                for number, label in options
+            ])
+        else:
+            sess["choice"] = None
+        await send_long(message, answer, ParseMode.HTML, markup)
     else:
-        await update.message.reply_text(f"⚠️ omp exited with code {proc.returncode} and no output.")
+        sess["choice"] = None
+        if stderr_text:
+            await send_long(message, f"⚠️ omp produced no output.\n\n{stderr_text}")
+        else:
+            await message.reply_text(f"⚠️ omp exited with code {proc.returncode} and no output.")
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -695,17 +728,46 @@ async def on_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     sess = get_session(user_id)
+    sess["choice"] = None
     if sess["lock"].locked():
         await update.message.reply_text("⏳ A task is already running. Use /stop first.")
         return
 
     async with sess["lock"]:
         try:
-            await run_omp(user_id, prompt, update, context)
+            await run_omp(user_id, prompt, update.message, context)
         except Exception:
             logger.exception("omp run failed")
             await update.message.reply_text("❌ Internal error while running omp. Check service logs.")
 
+
+async def on_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        await query.answer("Unauthorized", show_alert=True)
+        return
+    sess = get_session(user_id)
+    choice = sess.get("choice")
+    parts = (query.data or "").split(":")
+    if (len(parts) != 3 or not choice or parts[1] != choice[0]
+            or query.message.chat_id != choice[1] or sess["omp_session_id"] != choice[2]
+            or parts[2] not in choice[3]):
+        await query.answer("This choice has expired.", show_alert=True)
+        return
+    if sess["lock"].locked():
+        await query.answer("A task is still running.", show_alert=True)
+        return
+    await query.answer()
+    sess["choice"] = None
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.message.reply_text(f"✅ Selected {parts[2]}. {choice[3][parts[2]]}")
+    async with sess["lock"]:
+        try:
+            await run_omp(user_id, parts[2], query.message, context)
+        except Exception:
+            logger.exception("omp choice run failed")
+            await query.message.reply_text("❌ Internal error while running omp. Check service logs.")
 
 async def post_init(application: Application) -> None:
     await application.bot.set_my_commands(
@@ -742,6 +804,7 @@ def main() -> None:
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("model", cmd_model))
+    app.add_handler(CallbackQueryHandler(on_choice, pattern=r"^choice:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_prompt))
 
     app.run_polling(drop_pending_updates=True)

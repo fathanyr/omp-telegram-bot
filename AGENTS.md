@@ -69,6 +69,8 @@ Telegram User (ID whitelist)
 | `tool_execution_end` (`isError`) | Append `⚠️ <tool> failed` marker |
 | `agent_end` | Authoritative final assistant text source |
 
+Final answers escape untrusted HTML and render paired `**bold**` as Telegram HTML bold. A completed answer ending in a contiguous numbered list (1–8, two or more choices) receives inline buttons; callbacks authorize the user, validate an opaque per-session token and chat, and resume OMP with the selected number. The `-p` subprocess does not accept interactive stdin: choices are a subsequent session turn, not an interruption of a running task. Progress shows elapsed time and tool activity without raw thinking or tool arguments.
+
 Tool summary line format: `🔧 <toolName>: <command|path|pattern|query|url|intent>` truncated to 120 chars.
 
 ---

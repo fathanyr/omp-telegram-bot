@@ -13,6 +13,7 @@ An interactive Telegram bot that exposes the **`omp` (Oh My Pi)** agentic coding
 - 🛑 **Task Cancellation**: Cancel running tasks instantly with `/stop` — terminates the entire process tree cleanly without leaving orphaned processes.
 - 🔄 **Session Continuity**: Multi-turn conversation context is preserved across prompts using omp session resume (`-r <session_id>`); reset anytime with `/reset`.
 - ⚡ **Real-Time Progress Streaming**: Live throttled status messages report tool executions (`bash`, `read`, `edit`, `glob`, etc.) in real time.
+- 💬 **Readable Replies & Choices**: OMP `**bold**` renders as Telegram bold. When a completed answer ends with a numbered 1–8 choice list, tap an inline button to send that number as the next turn; ordinary text prompts still work. Progress shows a compact working indicator instead of raw reasoning/tool logs. Buttons expire after another prompt or session change.
 - 🛡️ **Strict Access Control**: Only messages from your whitelisted Telegram user ID are processed; all unauthorized requests are immediately dropped.
 - 🐳 **Docker-Ready**: Packaged with Docker Compose for single-command deployment with host user UID/GID mapping and volume mounts.
 
