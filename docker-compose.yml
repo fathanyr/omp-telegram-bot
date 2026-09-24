@@ -1,0 +1,31 @@
+services:
+  omp-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Keep container file ownership aligned with the host user so that
+        # files created inside the container stay editable on the host.
+        # Set these in .env:  HOST_UID=$(id -u)  HOST_GID=$(id -g)
+        UID: ${HOST_UID:-1000}
+        GID: ${HOST_GID:-1000}
+    image: omp-telegram-bot:latest
+    container_name: omp-telegram-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DEFAULT_CWD: /workspace
+      OMP_BIN: /usr/local/bin/omp
+      HOME: /home/omp
+    volumes:
+      # omp CLI binary from the host (read-only)
+      - ${HOST_OMP_BIN:-${HOME}/.local/bin/omp}:/usr/local/bin/omp:ro
+      # omp configuration, model catalog, sessions and credentials
+      - ${HOST_OMP_HOME:-${HOME}/.omp}:/home/omp/.omp
+      # omp provider / model definitions (read-only)
+      - ${HOST_OMP_CONFIG:-${HOME}/.config/oh-my-pi}:/home/omp/.config/oh-my-pi:ro
+      # Workspace: repositories the agent inspects and modifies (read-write)
+      - ${HOST_WORKSPACE_DIR:-${HOME}}:/workspace
+    init: true
+    stop_grace_period: 15s

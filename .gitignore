@@ -1,0 +1,38 @@
+# Environment variables (MUST be kept secret!)
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+
+# Docker build artifacts
+
+# Logs and runtime artifacts
+*.log
+logs/
+run/
+daemons/
+autoqa.db
+
+# OS / Editor artifacts
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Temporary files
+/tmp/

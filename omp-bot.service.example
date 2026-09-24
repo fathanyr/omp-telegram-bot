@@ -1,0 +1,19 @@
+[Unit]
+Description=OMP Telegram Bot Service
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_SYSTEM_USER
+WorkingDirectory=/path/to/omp-telegram-bot
+EnvironmentFile=/path/to/omp-telegram-bot/.env
+ExecStart=/path/to/omp-telegram-bot/venv/bin/python bot.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+KillMode=mixed
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
