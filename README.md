@@ -1,20 +1,20 @@
 # 🤖 OMP Telegram Bot
 
-An interactive Telegram bot that exposes the **`omp` (Oh My Pi)** agentic coding CLI directly to your messaging app. Control your autonomous agent, navigate directories, manage Git branches, switch models with automatic fallback, and execute coding tasks from anywhere.
+An interactive Telegram bot that exposes the **`omp` (Oh My Pi)** agentic coding CLI through your private chat. Navigate a configured workspace, switch Git branches and models, and run coding tasks remotely.
 
 ---
 
 ## Features
 
 - 🚀 **Full OMP CLI Access**: Run agentic coding tasks, shell commands, file edits, and codebase questions directly through Telegram.
-- 📂 **Directory Navigation**: Use `/cd` to hop between repositories or folders with instant path validation.
-- 🌿 **Git Branch Management**: Inspect uncommitted changes with `/pwd`, list branches with `/branch`, and checkout or create branches via `/checkout <branch>`.
-- 🧩 **Model Switching & Automatic Fallback**: Switch between available models on the fly with `/model <name>`. If a chosen model errors out, the runner automatically falls back to `openai-codex/gpt-5.6-luna` (or your configured `FALLBACK_MODEL`).
-- 🛑 **Task Cancellation**: Cancel running tasks instantly with `/stop` — terminates the entire process tree cleanly without leaving orphaned processes.
-- 🔄 **Session Continuity**: Multi-turn conversation context is preserved across prompts using omp session resume (`-r <session_id>`); reset anytime with `/reset`.
-- ⚡ **Real-Time Progress Streaming**: Live throttled status messages report tool executions (`bash`, `read`, `edit`, `glob`, etc.) in real time.
-- 💬 **Readable Replies & Choices**: OMP `**bold**` renders as Telegram bold. When a completed answer ends with a numbered 1–8 choice list, tap an inline button to send that number as the next turn; ordinary text prompts still work. Progress shows a compact working indicator instead of raw reasoning/tool logs. Buttons expire after another prompt or session change.
-- 🛡️ **Strict Access Control**: Only messages from your whitelisted Telegram user ID are processed; all unauthorized requests are immediately dropped.
+- 📂 **Directory Navigation**: Use `/cd` within the configured workspace boundary; host runs without a boundary do not restrict navigation.
+- 🌿 **Git Branch Management**: Inspect changes with `/pwd`, list branches with `/branch`, and switch to an existing branch via `/checkout <branch>`.
+- 🧩 **Model Switching**: Select a model with `/model <name>` or restore the CLI default with `/model default`; model changes start a fresh session. `FALLBACK_MODEL` identifies a configured alternative but failed work is not automatically replayed.
+- 🛑 **Task Cancellation**: `/stop` requests termination of the active OMP process group. A stopped task is not retried.
+- 🔄 **Session Continuity**: Prompts resume the current OMP session; `/reset` clears the session ID.
+- ⚡ **Progress Streaming**: Throttled status messages summarize activity without exposing raw reasoning or tool arguments.
+- 💬 **Readable Replies & Choices**: Completed numbered choices may appear as inline buttons that submit a follow-up turn; stale buttons do not run a task.
+- 🛡️ **Access Control**: Only the configured numeric user ID in a private chat may control the bot. This does not sandbox OMP from files reachable by the service account.
 - 🐳 **Docker-Ready**: Packaged with Docker Compose for single-command deployment with host user UID/GID mapping and volume mounts.
 
 ---
@@ -26,14 +26,14 @@ An interactive Telegram bot that exposes the **`omp` (Oh My Pi)** agentic coding
 | `/start`, `/help` | Bot overview, current directory, active branch, session ID, and command menu |
 | `/model` | Show current model, available catalog models, and fallback model |
 | `/model <selector>` | Switch model (e.g. `/model Coding`, `/model openai-codex/gpt-5.6-luna`), or `/model default` |
-| `/pwd` | Active directory, active Git branch, and short uncommitted git status (`git status -sb`) |
-| `/cd <path>` | Switch working directory (supports `~`, relative, or absolute paths) |
-| `/branch` | List local and remote Git branches sorted by commit recency |
-| `/checkout <branch>` | Switch branch (fetches remotes first; supports `-b <new_branch>`) |
-| `/status` | Check if omp is currently executing a task, elapsed time, and session ID |
-| `/stop` | Abort the running task and kill all child processes immediately |
-| `/reset` | Clear the session ID to start a completely fresh omp context |
-| `<Any text prompt>` | Sends the text to `omp -p --auto-approve --mode json` in the active directory |
+| `/pwd` | Active directory, branch, and concise Git status |
+| `/cd <path>` | Switch directory within the configured workspace boundary (relative or absolute path); starts a fresh session |
+| `/branch` | List local and remote branches |
+| `/checkout <branch>` | Switch to an existing branch; does not fetch remotes or create branches; starts a fresh session |
+| `/status` | Show active task, elapsed time, and session ID |
+| `/stop` | Terminate the active task, even while a prompt is running |
+| `/reset` | Start a fresh OMP session |
+| `<Any text prompt>` | Run `omp -p --auto-approve --mode json` in the active directory |
 
 ---
 
@@ -44,7 +44,6 @@ An interactive Telegram bot that exposes the **`omp` (Oh My Pi)** agentic coding
 - A Linux host with:
   - **Docker** and **Docker Compose** (recommended) OR **Python 3.12+** and **Git**
   - **`omp` CLI** installed (e.g., at `~/.local/bin/omp`) and authenticated with your AI providers
-- A Telegram bot token from [@BotFather](https://t.me/BotFather)
 - Your Telegram numeric user ID (get it from [@userinfobot](https://t.me/userinfobot))
 
 ---
@@ -66,30 +65,17 @@ Copy the example environment file and fill in your credentials:
 cp .env.example .env
 ```
 
-Edit `.env`:
+Edit `.env` with a real token and decimal numeric `ALLOWED_USER_ID`; only that user's private chat is accepted. For Docker, replace all `/home/youruser/...` placeholders with existing absolute host paths (never `~`). `HOST_OMP_BIN` is the executable, `HOST_OMP_HOME` stores OMP sessions/authentication, `HOST_OMP_CONFIG` contains provider definitions, and `HOST_WORKSPACE_DIR` is the one intended project directory, not your home directory. Compose mounts that directory at `/workspace` and sets `WORKSPACE_ROOT=/workspace` for `/cd`.
 
-```ini
-# REQUIRED: Telegram Bot token from @BotFather
-TELEGRAM_BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrsTUVwxyz
+Set `HOST_UID` and `HOST_GID` to the workspace owner's IDs; Compose fixes `DEFAULT_CWD=/workspace` and `OMP_BIN=/usr/local/bin/omp`. `FALLBACK_MODEL` is optional.
 
-# REQUIRED: Your numeric Telegram user ID
-ALLOWED_USER_ID=123456789
-
-# OPTIONAL: Default working directory inside the container
-DEFAULT_CWD=/workspace
-
-# OPTIONAL: Path to omp CLI in container
-OMP_BIN=/usr/local/bin/omp
-
-# OPTIONAL: Fallback model if the selected model errors
-FALLBACK_MODEL=openai-codex/gpt-5.6-luna
-
-# OPTIONAL: Host paths for Docker mounts (defaults to standard locations)
-HOST_OMP_BIN=~/.local/bin/omp
-HOST_WORKSPACE_DIR=~
+```bash
+id -u
+id -g
+chmod 600 .env
 ```
 
-> **Security Note:** Never commit your `.env` file to version control. It is already added to `.gitignore`.
+Keep `.env` and provider credentials private. `.dockerignore` sends only `bot.py`, `requirements.txt`, and `Dockerfile` to the build context, but runtime bind mounts still expose their contents to OMP. Do not mount sensitive directories or repositories you do not intend the agent to modify.
 
 ---
 
@@ -113,6 +99,8 @@ docker compose logs -f
 docker compose down
 ```
 
+The mounted OMP binary must run on the image's Linux architecture and glibc; a host executable linked against unavailable libraries will not work. Container Git trusts repositories owned by the mapped UID, **not every path**. If Git reports dubious ownership, correct the workspace ownership or explicitly configure `safe.directory` for that specific trusted repository as the container user; do not use `safe.directory '*'`.
+
 #### Option B: Run on Bare Metal (Systemd / Local Venv)
 
 If you prefer to run directly on the host:
@@ -129,6 +117,8 @@ pip install -r requirements.txt
 python bot.py
 ```
 
+For host operation, set `OMP_BIN` and `DEFAULT_CWD` to absolute host paths in `.env`; set `WORKSPACE_ROOT` to an absolute directory to confine `/cd`. Without `WORKSPACE_ROOT`, host `/cd` navigation is unrestricted. Run the service as a non-root user with access only to the intended workspace and OMP credentials. OMP uses auto-approval and can execute commands and modify any path accessible to that user; Telegram authorization and `/cd` confinement do not sandbox OMP subprocesses.
+
 To run as a system service with auto-restart on boot:
 
 ```bash
@@ -144,7 +134,11 @@ sudo systemctl enable --now omp-bot
 journalctl -u omp-bot -f
 ```
 
-> **Important:** Only run **one** instance of the bot at a time (Docker OR Systemd, not both). Telegram allows only one polling connection per token; multiple instances will produce `409 Conflict` errors.
+Edit the unit's `User`, `WorkingDirectory`, `EnvironmentFile`, and `ExecStart` paths before enabling it. Ensure `.env` is owned by and readable only by the service user (`chmod 600 .env`), and the OMP executable and credentials are available to that same user. The unit uses `KillMode=control-group` so stopping the service terminates spawned tasks. Keep only one polling instance per token; stop the previous instance before switching between Compose and systemd. A restart clears in-memory bot session selections, and an interrupted OMP task is not automatically resumed.
+
+While a task runs, `/stop` remains available; directory, model, branch, and session changes are rejected until the run ends. Failed tasks are not blindly replayed after possible side effects: inspect the workspace and decide whether to send a new prompt. `/checkout` changes to an existing branch without fetching; fetch updates separately in your workspace if needed. Inline choice buttons are follow-up turns, not interactive stdin to an in-progress process.
+
+> **Important:** Run one polling instance per token (Docker **or** systemd, not both); concurrent polling produces Telegram `409 Conflict` errors.
 
 ---
 
@@ -155,7 +149,7 @@ omp-telegram-bot/
 ├── .env.example              # Template environment configuration
 ├── .gitignore                # Protects secrets, venv, and logs from git
 ├── .dockerignore             # Excludes secrets and caches from Docker image
-├── Dockerfile                # Multi-stage container build with user mapping
+├── Dockerfile                # Minimal runtime image with host UID/GID mapping
 ├── docker-compose.yml        # Service definition with volume mounts
 ├── requirements.txt          # Python dependencies (python-telegram-bot, python-dotenv)
 ├── bot.py                    # Core bot logic, streaming parser, and commands

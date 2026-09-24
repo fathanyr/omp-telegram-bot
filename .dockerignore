@@ -1,6 +1,5 @@
-__pycache__/
-venv/
-*.pyc
-.env
-.git/
-omp-telegram-bot.log
+# Only the runtime source and requirements are needed in the image.
+**
+!bot.py
+!requirements.txt
+!Dockerfile

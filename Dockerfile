@@ -26,13 +26,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Trust all mounted repositories (host-owned) for the runtime user
-USER ${USERNAME}
-RUN git config --global --add safe.directory '*'
-
-USER root
-COPY bot.py README.md AGENTS.md PRD.md RULES.md ./
-RUN chown -R "${USERNAME}:${USERNAME}" /app
+# Do not mark arbitrary mounted repositories as safe. Matching host UID/GID
+# lets Git trust repositories owned by the container user; fix ownership or
+# configure an explicit safe.directory for a known repository if necessary.
+COPY --chown=${USERNAME}:${USERNAME} bot.py ./
 
 USER ${USERNAME}
 

@@ -29,9 +29,7 @@ Telegram User (ID whitelist)
                 │
                 ├── final_text_from_events() → chunked reply
                 │
-                └── Auto-Fallback Handler (retries with FALLBACK_MODEL on non-zero exit)
-                        ▲
-                        └─ Suppressed if task was terminated via /stop
+                └── Non-zero exit reports failure without blindly replaying work
 ```
 
 ---
@@ -46,13 +44,13 @@ Telegram User (ID whitelist)
 | `model` | `str \| None` | Custom model selector; `None` uses omp default |
 | `omp_session_id` | `str \| None` | Resumed omp session ID; `None` starts a fresh session |
 | `proc` | `Process \| None` | Currently running omp subprocess handle |
-| `stopped` | `bool` | Flag set by `/stop` to prevent fallback retries |
+| `stopped` | `bool` | Flag set by `/stop` for cancellation |
 | `started_at` | `float \| None` | `time.monotonic()` start stamp of the running task |
 | `lock` | `asyncio.Lock` | Serializes one omp task per user |
 
-**Reset semantics**: `/cd`, `/checkout`, and `/model <choice>` reset `omp_session_id = None` because agent context is directory-, branch-, and model-scoped.
+**Reset semantics**: `/cd`, `/checkout`, and `/model` selection (including `default`) clear `omp_session_id`. Context-changing commands are rejected during an active task; `/stop` remains available concurrently.
 
-**Fallback invariant**: If execution exits non-zero, `model != FALLBACK_MODEL`, and `stopped == False`, the runner automatically retries fresh with `FALLBACK_MODEL`.
+**Failure semantics**: Do not automatically replay failed work after possible tool side effects; report failure so the user can inspect the workspace and decide whether to retry.
 
 ---
 
@@ -81,14 +79,14 @@ Tool summary line format: `🔧 <toolName>: <command|path|pattern|query|url|inte
 |---|---|
 | `/start`, `/help` | Report cwd, branch, session id, active model, and full command menu |
 | `/pwd` | `git rev-parse --is-inside-work-tree`, `branch --show-current`, `status -sb` |
-| `/cd <path>` | Resolve `~`/relative/absolute, validate dir, set cwd, clear session |
-| `/branch` | `git branch -a --sort=-committerdate` (top 60) |
-| `/checkout <branch>` | `git fetch --all --prune` then `git checkout <args>`; clear session |
-| `/model` | List available models, show active selection and fallback |
-| `/model <choice>` | Switch active model selector, clear session, auto-fallback enabled |
-| `/model default` | Reset model selector to omp default |
+| `/cd <path>` | Resolve path within configured workspace boundary when set; validate directory, set cwd, clear session |
+| `/branch` | List local and remote branches |
+| `/checkout <branch>` | Checkout an existing branch without unconditional fetch; clear session |
+| `/model` | List available models, show active selection and configured fallback |
+| `/model <choice>` | Switch active model selector and clear session |
+| `/model default` | Reset model selector and clear session |
 | `/status` | Idle vs running (with elapsed time), cwd, session id, active model |
-| `/stop` | `SIGTERM` → 0.7s grace → `SIGKILL` → `pkill -9 -g <pgid>`, set `stopped=True` |
+| `/stop` | Terminate the active OMP process group even while a prompt is running |
 | `/reset` | Clear `omp_session_id` |
 | `<plain text>` | Run `omp -p --auto-approve --mode json` in cwd |
 
@@ -97,11 +95,11 @@ Tool summary line format: `🔧 <toolName>: <command|path|pattern|query|url|inte
 ## Operational Invariants
 
 - **Single polling instance** per bot token; `drop_pending_updates=True` on startup.
-- **Authorization first** in every handler; unauthorized users are rejected before any subprocess runs.
-- **Secret isolation**: No credentials or private IDs in tracked files.
-- **Model fallback**: Any non-zero exit on a non-fallback model retries with `FALLBACK_MODEL` unless user invoked `/stop`.
-- **Output sanitization**: ANSI escapes stripped, HTML escaped, chunking on line boundaries under 4000 chars.
-- **Process group isolation**: `start_new_session=True` ensures `/stop` kills the entire descendant process tree.
+- **Authorization first**: Require a decimal numeric configured user ID and a matching private chat before subprocesses run.
+- **Secret isolation**: No credentials in tracked files or Docker build context; runtime credentials remain accessible to OMP.
+- **No blind retry**: Non-zero exits do not trigger automatic replay of potentially side-effecting tasks.
+- **Output sanitization**: Escape untrusted HTML and chunk Telegram messages within limits.
+- **Process group isolation**: `start_new_session=True` allows `/stop` to terminate descendants.
 - **Stream parsing**: Bytearray chunked buffer handles tool payloads >64KB safely.
 
 ---
@@ -114,5 +112,7 @@ The bot can run containerized (`docker compose`) or via host `systemd`:
 |---|---|---|---|
 | `${HOST_OMP_BIN}` | `/usr/local/bin/omp` | ro | omp CLI binary (dynamically linked, glibc-compatible) |
 | `${HOST_OMP_HOME}` | `/home/omp/.omp` | rw | omp config, model catalog, sessions, credentials |
-| `${HOST_OMP_CONFIG}` | `/home/omp/.config/oh-my-pi` | rw | Provider definitions (`models.yaml`) |
-| `${HOST_WORKSPACE_DIR}` | `/workspace` | rw | Repositories the agent inspects and modifies |
+| `${HOST_OMP_CONFIG}` | `/home/omp/.config/oh-my-pi` | ro | Provider definitions (`models.yaml`) |
+| `${HOST_WORKSPACE_DIR}` | `/workspace` | rw | One explicitly selected repository or project directory |
+
+Compose requires absolute host paths, maps host UID/GID, sets `WORKSPACE_ROOT=/workspace`, and does not grant blanket Git `safe.directory` trust. Host systemd runs as a non-root workspace owner with absolute host `OMP_BIN` and `DEFAULT_CWD`; set `WORKSPACE_ROOT` to confine `/cd` (without it, host navigation is unrestricted). The boundary restricts `/cd`, not OMP subprocess filesystem access. Only one polling instance may use a bot token.

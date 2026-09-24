@@ -42,10 +42,14 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ALLOWED_USER_ID = os.getenv("ALLOWED_USER_ID")
 OMP_BIN = os.getenv("OMP_BIN") or os.path.expanduser("~/.local/bin/omp")
 DEFAULT_CWD = os.path.expanduser(os.getenv("DEFAULT_CWD", "~"))
+WORKSPACE_ROOT = os.getenv("WORKSPACE_ROOT") or ("/workspace" if os.path.isdir("/workspace") and os.getenv("DEFAULT_CWD") == "/workspace" else None)
 
 TG_LIMIT = 4000
 STATUS_EDIT_INTERVAL = 1.5
 MAX_TOOL_LINES = 8
+MAX_EVENT_LINE = 1024 * 1024
+MAX_EVENTS = 16
+MAX_STREAM_TEXT = 65536
 FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "openai-codex/gpt-5.6-luna")
 
 ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
@@ -93,6 +97,8 @@ def new_session(cwd: str) -> dict:
         "proc": None,
         "stopped": False,
         "started_at": None,
+        "busy": False,
+        "generation": 0,
         "lock": asyncio.Lock(),
         "choice": None,
     }
@@ -109,9 +115,19 @@ def get_session(user_id: int) -> dict:
 
 
 def is_authorized(user_id: int) -> bool:
-    if not ALLOWED_USER_ID:
+    return bool(ALLOWED_USER_ID and str(user_id) == ALLOWED_USER_ID.strip())
+
+
+def allowed_update(update: Update) -> bool:
+    return (update.effective_chat is not None and update.effective_chat.type == "private"
+            and update.effective_user is not None and is_authorized(update.effective_user.id))
+
+
+async def reject_busy(sess: dict, message) -> bool:
+    if sess["busy"]:
+        await message.reply_text("⏳ A task is already running. Use /stop first.")
         return True
-    return str(user_id) == str(ALLOWED_USER_ID)
+    return False
 
 
 async def git(cwd: str, *args: str) -> tuple[int, str, str]:
@@ -154,14 +170,24 @@ async def fetch_available_models() -> list[dict]:
     return []
 
 
+def telegram_length(text: str) -> int:
+    """Telegram measures message text in UTF-16 code units."""
+    return len(text.encode("utf-16-le", errors="surrogatepass")) // 2
+
+
 async def send_long(message, text: str, parse_mode: str | None = None, reply_markup=None) -> None:
-    """Split untrusted text before escaping; preserve bold pairs across chunks."""
+    """Split replies within Telegram's limit after HTML encoding."""
     text = clean_text(text)
-    if not text:
-        return
-    chunks = []
     while text:
-        cut = min(len(text), TG_LIMIT // 2 if parse_mode == ParseMode.HTML else TG_LIMIT)
+        low, high = 1, min(len(text), TG_LIMIT)
+        while low < high:
+            mid = (low + high + 1) // 2
+            rendered = format_answer(text[:mid]) if parse_mode == ParseMode.HTML else text[:mid]
+            if telegram_length(rendered) <= TG_LIMIT:
+                low = mid
+            else:
+                high = mid - 1
+        cut = low
         if cut < len(text):
             boundary = text.rfind("\n", 0, cut)
             if boundary > cut // 2:
@@ -170,14 +196,26 @@ async def send_long(message, text: str, parse_mode: str | None = None, reply_mar
                 boundary = text.rfind("**", 0, cut)
                 if boundary > 0:
                     cut = boundary
-        chunks.append(text[:cut])
-        text = text[cut:]
-    for index, part in enumerate(chunks):
+        part, text = text[:cut], text[cut:]
         await message.reply_text(
             format_answer(part) if parse_mode == ParseMode.HTML else part,
             parse_mode=parse_mode,
-            reply_markup=reply_markup if index == len(chunks) - 1 else None,
+            reply_markup=reply_markup if not text else None,
         )
+
+async def send_pre(message, heading: str, text: str) -> None:
+    """Send command output in bounded escaped HTML preformatted chunks."""
+    text = clean_text(text) or "(no output)"
+    while text:
+        low, high = 1, min(len(text), TG_LIMIT)
+        while low < high:
+            mid = (low + high + 1) // 2
+            if telegram_length(heading + f"<pre>{esc(text[:mid])}</pre>") <= TG_LIMIT:
+                low = mid
+            else:
+                high = mid - 1
+        part, text = text[:low], text[low:]
+        await message.reply_text(f"{heading}<pre>{esc(part)}</pre>", parse_mode=ParseMode.HTML)
 
 
 async def keep_typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int, stop: asyncio.Event) -> None:
@@ -213,21 +251,23 @@ def tool_line(name: str, args: dict) -> str:
 
 def extract_text(message: dict) -> str:
     parts = message.get("content") or []
-    texts = [
-        part.get("text", "")
-        for part in parts
-        if isinstance(part, dict) and part.get("type") == "text"
-    ]
-    return clean_text("\n".join(t for t in texts if t))
+    if not isinstance(parts, list):
+        return ""
+    texts = [part.get("text") for part in parts
+             if isinstance(part, dict) and part.get("type") == "text"
+             and isinstance(part.get("text"), str)]
+    return clean_text("\n".join(texts))[-MAX_STREAM_TEXT:]
 
 
 def final_text_from_events(events: list[dict]) -> str:
     for event in reversed(events):
-        if event.get("type") != "agent_end":
+        if not isinstance(event, dict) or event.get("type") != "agent_end":
             continue
         messages = event.get("messages") or []
+        if not isinstance(messages, list):
+            continue
         for message in reversed(messages):
-            if message.get("role") != "assistant":
+            if not isinstance(message, dict) or message.get("role") != "assistant":
                 continue
             text = extract_text(message)
             if text:
@@ -252,23 +292,26 @@ class StreamState:
 
 
 async def iter_json_lines(stream: asyncio.StreamReader):
-    """Yield complete lines without limit issues from StreamReader.readline()."""
+    """Drain oversized lines without retaining them or parsing partial JSON."""
     buf = bytearray()
-    while True:
-        chunk = await stream.read(65536)
-        if not chunk:
-            if buf:
-                yield buf.decode(errors="replace").strip()
-            break
-        buf.extend(chunk)
-        while True:
-            nl = buf.find(b"\n")
-            if nl == -1:
-                break
-            line = buf[:nl].decode(errors="replace").strip()
-            del buf[: nl + 1]
-            if line:
-                yield line
+    oversized = False
+    while chunk := await stream.read(65536):
+        parts = chunk.split(b"\n")
+        for segment in parts[:-1]:
+            if not oversized and len(buf) + len(segment) <= MAX_EVENT_LINE:
+                buf.extend(segment)
+                if buf.strip():
+                    yield buf.decode(errors="replace").strip()
+            buf.clear()
+            oversized = False
+        segment = parts[-1]
+        if not oversized and len(buf) + len(segment) <= MAX_EVENT_LINE:
+            buf.extend(segment)
+        else:
+            buf.clear()
+            oversized = True
+    if buf and not oversized:
+        yield buf.decode(errors="replace").strip()
 
 
 async def pump_stdout(proc: asyncio.subprocess.Process, state: StreamState, on_update) -> None:
@@ -277,45 +320,50 @@ async def pump_stdout(proc: asyncio.subprocess.Process, state: StreamState, on_u
     async for line in iter_json_lines(proc.stdout):
         try:
             event = json.loads(line)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(event, dict):
             continue
         state.events.append(event)
+        if len(state.events) > MAX_EVENTS:
+            del state.events[:-MAX_EVENTS]
         kind = event.get("type")
         dirty = False
 
         if kind == "session":
-            state.session_id = event.get("id")
+            session_id = event.get("id")
+            if isinstance(session_id, str):
+                state.session_id = session_id
         elif kind == "message_start":
             message = event.get("message") or {}
-            # Assistant message start: only capture thinking/text here.
             # tool_execution_start gives us the authoritative tool run events.
-            if message.get("role") == "assistant":
-                for part in message.get("content") or []:
+            if isinstance(message, dict) and message.get("role") == "assistant":
+                for part in message.get("content") if isinstance(message.get("content"), list) else []:
                     if not isinstance(part, dict):
                         continue
                     if part.get("type") == "thinking":
-                        state.thinking = part.get("thinking", "") or state.thinking
+                        state.thinking = str(part.get("thinking", "") or state.thinking)[-MAX_STREAM_TEXT:]
                         dirty = True
                     elif part.get("type") == "text":
-                        state.text = part.get("text", "") or state.text
+                        state.text = str(part.get("text", "") or state.text)[-MAX_STREAM_TEXT:]
                         dirty = True
         elif kind == "message_update":
             inner = event.get("assistantMessageEvent") or {}
-            inner_kind = inner.get("type")
+            inner_kind = inner.get("type") if isinstance(inner, dict) else None
             if inner_kind == "thinking_delta":
-                state.thinking += inner.get("delta", "")
+                state.thinking = (state.thinking + str(inner.get("delta", "")))[-MAX_STREAM_TEXT:]
                 dirty = True
             elif inner_kind == "text_delta":
-                state.text += inner.get("delta", "")
+                state.text = (state.text + str(inner.get("delta", "")))[-MAX_STREAM_TEXT:]
                 dirty = True
         elif kind == "tool_execution_start":
-            state.tool_lines.append(
-                tool_line(event.get("toolName", "tool"), event.get("args") or {})
-            )
+            state.tool_lines.append(tool_line(str(event.get("toolName", "tool"))[:80], event.get("args") or {}))
+            del state.tool_lines[:-MAX_TOOL_LINES]
             dirty = True
         elif kind == "tool_execution_end":
             if event.get("isError"):
-                state.tool_lines.append(f"⚠️ {event.get('toolName', 'tool')} failed")
+                state.tool_lines.append(f"⚠️ {str(event.get('toolName', 'tool'))[:80]} failed")
+                del state.tool_lines[:-MAX_TOOL_LINES]
                 dirty = True
 
         if not dirty:
@@ -328,17 +376,20 @@ async def pump_stdout(proc: asyncio.subprocess.Process, state: StreamState, on_u
 async def run_omp(user_id: int, prompt: str, message, context: ContextTypes.DEFAULT_TYPE) -> None:
     sess = get_session(user_id)
     cwd = sess["cwd"]
+    generation = sess["generation"]
+    session_id = sess["omp_session_id"]
+    model = sess["model"]
     chat_id = message.chat_id
-
     env = os.environ.copy()
     env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
     env["PATH"] = f"{Path(OMP_BIN).parent}:{Path.home()}/.local/bin:{env['PATH']}"
-
     status = await message.reply_text("⏳ Working...")
+    if sess["stopped"]:
+        await status.edit_text("🛑 Task cancelled.")
+        return
     state = StreamState()
     started = time.monotonic()
     sess["started_at"] = started
-
     typing_stop = asyncio.Event()
     typing_task = asyncio.create_task(keep_typing(context, chat_id, typing_stop))
 
@@ -348,68 +399,94 @@ async def run_omp(user_id: int, prompt: str, message, context: ContextTypes.DEFA
         except Exception:
             pass
 
-    async def launch(session_id: str | None, model: str | None):
-        nonlocal state
+    async def launch(resume: str | None, selected_model: str | None):
         cmd = [OMP_BIN, "-p", "--auto-approve", "--mode", "json"]
-        if model:
-            cmd += ["--model", model]
-        if session_id:
-            cmd += ["-r", session_id]
+        if selected_model:
+            cmd += ["--model", selected_model]
+        if resume:
+            cmd += ["-r", resume]
         cmd.append(prompt)
         proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=cwd,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
+            *cmd, cwd=cwd, env=env, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, start_new_session=True,
         )
         sess["proc"] = proc
-        stderr_task = asyncio.create_task(proc.stderr.read())
-        await pump_stdout(proc, state, on_update)
-        err_bytes = await stderr_task
-        await proc.wait()
-        return proc, err_bytes
+        if sess["stopped"]:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
 
-    used_model = sess.get("model")
-    fallback_used = False
+        async def drain_stderr() -> bytes:
+            chunks = bytearray()
+            while data := await proc.stderr.read(8192):
+                remaining = 65536 - len(chunks)
+                if remaining > 0:
+                    chunks.extend(data[:remaining])
+            return bytes(chunks)
+
+        stderr_task = asyncio.create_task(drain_stderr())
+        try:
+            await pump_stdout(proc, state, on_update)
+            stderr = await stderr_task
+            await proc.wait()
+            return proc, stderr
+        finally:
+            if proc.returncode is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2)
+                except asyncio.TimeoutError:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    await proc.wait()
+            if not stderr_task.done():
+                stderr_task.cancel()
+            await asyncio.gather(stderr_task, return_exceptions=True)
+            if sess["proc"] is proc:
+                sess["proc"] = None
+
+    proc = None
+    stderr_bytes = b""
     try:
-        sess["stopped"] = False
-        proc, stderr_bytes = await launch(sess["omp_session_id"], used_model)
-
-        if not sess["stopped"]:
-            # Case A: resume failed immediately with no events -> retry with a fresh session
-            if proc.returncode != 0 and sess["omp_session_id"] and not state.events:
-                logger.warning("Session %s resume failed, retrying fresh", sess["omp_session_id"])
-                sess["omp_session_id"] = None
-                state = StreamState()
-                proc, stderr_bytes = await launch(None, used_model)
-
-        # Case B: run failed and we are not already on the fallback model -> fail over.
-        # An explicit /stop must never trigger a fallback retry.
-        if proc.returncode != 0 and used_model != FALLBACK_MODEL and not sess["stopped"]:
-            logger.warning(
-                "Model %s failed (exit %s); falling back to %s",
-                used_model,
-                proc.returncode,
-                FALLBACK_MODEL,
-            )
-            fallback_used = True
+        proc, stderr_bytes = await launch(session_id, model)
+        error = stderr_bytes.decode(errors="replace").lower()
+        resume_rejected = bool(re.search(r"session\s+.+?\s+not found", error))
+        # A nonzero exit is not sufficient evidence for replay: work may have
+        # happened before failure. Retry only explicit pre-execution rejection.
+        if (proc.returncode != 0 and not sess["stopped"] and not state.events
+                and not state.session_id and session_id and resume_rejected):
+            logger.warning("Session %s resume rejected; retrying fresh", session_id)
             state = StreamState()
-            sess["omp_session_id"] = None
+            proc, stderr_bytes = await launch(None, model)
+            error = stderr_bytes.decode(errors="replace").lower()
+        model_rejected = any(word in error for word in (
+            "unknown model", "invalid model", "model not found", "unsupported model",
+            "model is not available", "unrecognized model",
+        ))
+        if (proc.returncode != 0 and not sess["stopped"] and not state.events
+                and not state.session_id and model != FALLBACK_MODEL and model_rejected):
+            logger.warning("Model %s rejected; falling back to %s", model, FALLBACK_MODEL)
+            state = StreamState()
             try:
                 await status.edit_text(
-                    f"⚠️ Model <code>{esc(used_model or 'default')}</code> failed. "
+                    f"⚠️ Model <code>{esc(model or 'default')}</code> unavailable. "
                     f"Falling back to <code>{esc(FALLBACK_MODEL)}</code>...",
                     parse_mode=ParseMode.HTML,
                 )
             except Exception:
                 pass
-            proc, stderr_bytes = await launch(None, FALLBACK_MODEL)
-            used_model = FALLBACK_MODEL
+            if not sess["stopped"]:
+                proc, stderr_bytes = await launch(None, FALLBACK_MODEL)
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:
-        typing_stop.set()
-        await typing_task
+        logger.exception("Failed to run omp")
         await status.edit_text(f"❌ Failed to run omp: {esc(str(exc))}", parse_mode=ParseMode.HTML)
         return
     finally:
@@ -418,23 +495,23 @@ async def run_omp(user_id: int, prompt: str, message, context: ContextTypes.DEFA
         sess["proc"] = None
         sess["started_at"] = None
 
-    elapsed = time.monotonic() - started
-    if state.session_id:
-        sess["omp_session_id"] = state.session_id
-
+    if generation == sess["generation"]:
+        # Failed or interrupted runs must not restore stale session identities.
+        sess["omp_session_id"] = state.session_id if proc.returncode == 0 and not sess["stopped"] else None
     answer = final_text_from_events(state.events) or clean_text(state.text)
     stderr_text = clean_text(stderr_bytes.decode(errors="replace"))
     try:
         await status.delete()
     except Exception:
         pass
-
     if answer:
         options = choice_options(answer)
         markup = None
-        if options and proc.returncode == 0 and not sess["stopped"] and sess["omp_session_id"]:
+        if (options and proc.returncode == 0 and not sess["stopped"]
+                and generation == sess["generation"] and sess["omp_session_id"]):
             token = secrets.token_urlsafe(12)
-            sess["choice"] = (token, chat_id, sess["omp_session_id"], {number: label for number, label in options})
+            sess["choice"] = (token, chat_id, sess["omp_session_id"],
+                              {number: label for number, label in options})
             markup = InlineKeyboardMarkup([
                 [InlineKeyboardButton(f"{number}. {label[:55]}", callback_data=f"choice:{token}:{number}")]
                 for number, label in options
@@ -451,8 +528,7 @@ async def run_omp(user_id: int, prompt: str, message, context: ContextTypes.DEFA
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorized(update.effective_user.id):
-        await update.message.reply_text("⛔ Unauthorized.")
+    if not allowed_update(update):
         return
     sess = get_session(update.effective_user.id)
     branch = await current_branch(sess["cwd"])
@@ -469,7 +545,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/cd &lt;path&gt; — change working directory",
         "/pwd — current dir, branch, git status",
         "/branch — list local/remote branches",
-        "/checkout &lt;branch&gt; — switch or create branch",
+        "/checkout &lt;branch&gt; — switch to an existing branch",
         "/status — running task info",
         "/stop — abort the running task",
         "/reset — start a fresh omp session",
@@ -481,7 +557,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_pwd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorized(update.effective_user.id):
+    if not allowed_update(update):
         return
     sess = get_session(update.effective_user.id)
     cwd = sess["cwd"]
@@ -507,9 +583,11 @@ async def cmd_pwd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_cd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorized(update.effective_user.id):
+    if not allowed_update(update):
         return
     sess = get_session(update.effective_user.id)
+    if context.args and await reject_busy(sess, update.message):
+        return
     if not context.args:
         await update.message.reply_text(
             f"📂 <code>{esc(sess['cwd'])}</code>\nUsage: <code>/cd &lt;path&gt;</code>",
@@ -525,7 +603,11 @@ async def cmd_cd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not resolved.is_absolute():
             resolved = Path(sess["cwd"]) / resolved
 
-    resolved = resolved.expanduser()
+    resolved = resolved.expanduser().resolve()
+    root = Path(WORKSPACE_ROOT).expanduser().resolve() if WORKSPACE_ROOT else None
+    if root and not resolved.is_relative_to(root):
+        await update.message.reply_text("❌ Path is outside the configured workspace.")
+        return
     if not resolved.exists():
         await update.message.reply_text(
             f"❌ Path does not exist:\n<code>{esc(str(resolved))}</code>", parse_mode=ParseMode.HTML
@@ -539,6 +621,8 @@ async def cmd_cd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     sess["cwd"] = str(resolved.resolve())
     sess["omp_session_id"] = None  # sessions are scoped per working directory
+    sess["generation"] += 1
+    sess["choice"] = None
 
     branch = await current_branch(sess["cwd"])
     suffix = f"\n🌿 <b>Branch:</b> <code>{esc(branch)}</code>" if branch else "\nℹ️ not a git repository"
@@ -549,61 +633,65 @@ async def cmd_cd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_branch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorized(update.effective_user.id):
+    if not allowed_update(update):
         return
     sess = get_session(update.effective_user.id)
     code, out, err = await git(sess["cwd"], "branch", "-a", "--sort=-committerdate")
     if code != 0:
-        await update.message.reply_text(
-            f"❌ git error in <code>{esc(sess['cwd'])}</code>:\n<pre>{esc(err or out)}</pre>",
-            parse_mode=ParseMode.HTML,
-        )
+        await send_pre(update.message, f"❌ git error in <code>{esc(sess['cwd'])}</code>:\n", err or out)
         return
     lines = out.splitlines()[:60]
-    await update.message.reply_text(
-        f"🌿 <b>Branches</b> (<code>{esc(sess['cwd'])}</code>)\n<pre>{esc(chr(10).join(lines))}</pre>",
-        parse_mode=ParseMode.HTML,
-    )
+    await send_pre(update.message, f"🌿 <b>Branches</b> (<code>{esc(sess['cwd'])}</code>)\n", "\n".join(lines))
 
 
 async def cmd_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorized(update.effective_user.id):
+    if not allowed_update(update):
         return
     sess = get_session(update.effective_user.id)
     if not context.args:
         await update.message.reply_text(
-            "Usage: <code>/checkout &lt;branch&gt;</code> or <code>/checkout -b &lt;new-branch&gt;</code>",
+            "Usage: <code>/checkout &lt;existing-branch&gt;</code>",
             parse_mode=ParseMode.HTML,
         )
         return
 
+    if await reject_busy(sess, update.message):
+        return
+    sess["busy"] = True
+    try:
+        await perform_checkout(sess, context.args, update.message)
+    finally:
+        sess["busy"] = False
+
+
+async def perform_checkout(sess: dict, args: list[str], message) -> None:
     code, _, _ = await git(sess["cwd"], "rev-parse", "--is-inside-work-tree")
     if code != 0:
-        await update.message.reply_text("❌ Not a git repository.", parse_mode=ParseMode.HTML)
+        await message.reply_text("❌ Not a git repository.")
         return
 
-    args = list(context.args)
-    if args[0] != "-b":
-        await git(sess["cwd"], "fetch", "--all", "--prune")
-
-    code, out, err = await git(sess["cwd"], "checkout", *args)
+    if len(args) != 1 or args[0].startswith("-"):
+        await message.reply_text("Usage: /checkout <existing-branch>")
+        return
+    branch = args[0]
+    valid, _, _ = await git(sess["cwd"], "check-ref-format", "--branch", branch)
+    if valid != 0:
+        await message.reply_text("❌ Invalid branch name.")
+        return
+    code, out, err = await git(sess["cwd"], "switch", "--no-guess", "--", branch)
     if code != 0:
-        await update.message.reply_text(
-            f"❌ Checkout failed:\n<pre>{esc(err or out)}</pre>", parse_mode=ParseMode.HTML
-        )
+        await send_pre(message, "❌ Checkout failed:\n", err or out)
         return
-
     branch = await current_branch(sess["cwd"])
     sess["omp_session_id"] = None
+    sess["generation"] += 1
+    sess["choice"] = None
     detail = clean_text("\n".join(x for x in (out, err) if x))
-    await update.message.reply_text(
-        f"✅ <b>Branch:</b> <code>{esc(branch or '?')}</code>\n<pre>{esc(detail[:600])}</pre>",
-        parse_mode=ParseMode.HTML,
-    )
+    await send_pre(message, f"✅ <b>Branch:</b> <code>{esc(branch or '?')}</code>\n", detail)
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorized(update.effective_user.id):
+    if not allowed_update(update):
         return
     sess = get_session(update.effective_user.id)
     proc = sess["proc"]
@@ -622,35 +710,27 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorized(update.effective_user.id):
+    if not allowed_update(update):
         return
     sess = get_session(update.effective_user.id)
     proc = sess["proc"]
-    if not proc or proc.returncode is not None:
+    if not sess["busy"]:
         await update.message.reply_text("ℹ️ No task is running.")
         return
+    sess["stopped"] = True
+    sess["generation"] += 1
+    sess["omp_session_id"] = None
+    sess["choice"] = None
+    if proc is None or proc.returncode is not None:
+        await update.message.reply_text("🛑 Task cancelled.")
+        return
     try:
-        sess["stopped"] = True
-        pgid = os.getpgid(proc.pid)
+        os.killpg(proc.pid, signal.SIGTERM)
         try:
-            os.killpg(pgid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        await asyncio.sleep(0.7)
-        if proc.returncode is None:
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        # Double-check any remaining children in the process group
-        try:
-            p = await asyncio.create_subprocess_exec(
-                "pkill", "-9", "-g", str(pgid),
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            await p.wait()
-        except Exception:
-            pass
+            await asyncio.wait_for(proc.wait(), timeout=2)
+        except asyncio.TimeoutError:
+            os.killpg(proc.pid, signal.SIGKILL)
+            await proc.wait()
         await update.message.reply_text("🛑 Task terminated.")
     except ProcessLookupError:
         await update.message.reply_text("ℹ️ Process already exited.")
@@ -659,16 +739,22 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorized(update.effective_user.id):
+    if not allowed_update(update):
         return
     sess = get_session(update.effective_user.id)
+    if await reject_busy(sess, update.message):
+        return
     sess["omp_session_id"] = None
+    sess["generation"] += 1
+    sess["choice"] = None
     await update.message.reply_text("🔄 Session cleared. Next message starts a fresh omp session.")
 
 async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorized(update.effective_user.id):
+    if not allowed_update(update):
         return
     sess = get_session(update.effective_user.id)
+    if context.args and await reject_busy(sess, update.message):
+        return
 
     if not context.args:
         current = sess.get("model") or "default"
@@ -687,12 +773,17 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     choice = " ".join(context.args).strip()
     if choice.lower() in {"default", "reset", "clear", "auto"}:
         sess["model"] = None
+        sess["omp_session_id"] = None
+        sess["choice"] = None
+        sess["generation"] += 1
         await update.message.reply_text(
-            "✅ Model reset to omp default.", parse_mode=ParseMode.HTML
+            "✅ Model reset to omp default; session cleared.", parse_mode=ParseMode.HTML
         )
         return
 
     models = await fetch_available_models()
+    if await reject_busy(sess, update.message):
+        return
     selectors = [m["selector"] for m in models if m.get("selector")]
     match = next((s for s in selectors if s.lower() == choice.lower()), None)
     if match is None:
@@ -708,6 +799,8 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Catalog unavailable: still let omp attempt the value (it does fuzzy matching itself).
     sess["model"] = match or choice
     sess["omp_session_id"] = None  # model switch invalidates session context
+    sess["generation"] += 1
+    sess["choice"] = None
     await update.message.reply_text(
         f"✅ <b>Model set:</b> <code>{esc(sess['model'])}</code>\n"
         f"↩️ Falls back to <code>{esc(FALLBACK_MODEL)}</code> if it fails.\n"
@@ -719,8 +812,7 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def on_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
-    if not is_authorized(user_id):
-        await update.message.reply_text("⛔ Unauthorized.")
+    if not allowed_update(update):
         return
 
     prompt = (update.message.text or "").strip()
@@ -728,23 +820,26 @@ async def on_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     sess = get_session(user_id)
-    sess["choice"] = None
-    if sess["lock"].locked():
+    if sess["busy"]:
         await update.message.reply_text("⏳ A task is already running. Use /stop first.")
         return
-
-    async with sess["lock"]:
-        try:
+    sess["busy"] = True
+    sess["stopped"] = False
+    sess["choice"] = None
+    try:
+        async with sess["lock"]:
             await run_omp(user_id, prompt, update.message, context)
-        except Exception:
-            logger.exception("omp run failed")
-            await update.message.reply_text("❌ Internal error while running omp. Check service logs.")
+    except Exception:
+        logger.exception("omp run failed")
+        await update.message.reply_text("❌ Internal error while running omp. Check service logs.")
+    finally:
+        sess["busy"] = False
 
 
 async def on_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     user_id = update.effective_user.id
-    if not is_authorized(user_id):
+    if not allowed_update(update):
         await query.answer("Unauthorized", show_alert=True)
         return
     sess = get_session(user_id)
@@ -755,19 +850,23 @@ async def on_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             or parts[2] not in choice[3]):
         await query.answer("This choice has expired.", show_alert=True)
         return
-    if sess["lock"].locked():
+    if sess["busy"]:
         await query.answer("A task is still running.", show_alert=True)
         return
-    await query.answer()
+    sess["busy"] = True
+    sess["stopped"] = False
     sess["choice"] = None
-    await query.edit_message_reply_markup(reply_markup=None)
-    await query.message.reply_text(f"✅ Selected {parts[2]}. {choice[3][parts[2]]}")
-    async with sess["lock"]:
-        try:
+    await query.answer()
+    try:
+        async with sess["lock"]:
+            await query.edit_message_reply_markup(reply_markup=None)
+            await query.message.reply_text(f"✅ Selected {parts[2]}. {choice[3][parts[2]]}")
             await run_omp(user_id, parts[2], query.message, context)
-        except Exception:
-            logger.exception("omp choice run failed")
-            await query.message.reply_text("❌ Internal error while running omp. Check service logs.")
+    except Exception:
+        logger.exception("omp choice run failed")
+        await query.message.reply_text("❌ Internal error while running omp. Check service logs.")
+    finally:
+        sess["busy"] = False
 
 async def post_init(application: Application) -> None:
     await application.bot.set_my_commands(
@@ -776,7 +875,7 @@ async def post_init(application: Application) -> None:
             BotCommand("cd", "Change working directory"),
             BotCommand("pwd", "Current directory, branch, git status"),
             BotCommand("branch", "List git branches"),
-            BotCommand("checkout", "Switch or create a git branch"),
+            BotCommand("checkout", "Switch to an existing git branch"),
             BotCommand("model", "Show or switch the omp model"),
             BotCommand("status", "Show running task"),
             BotCommand("stop", "Abort running task"),
@@ -793,7 +892,7 @@ def main() -> None:
         return
 
     logger.info("Starting OMP Telegram Bot (omp=%s)", OMP_BIN)
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).concurrent_updates(True).build()
 
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
     app.add_handler(CommandHandler("cd", cmd_cd))

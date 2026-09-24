@@ -1,18 +1,22 @@
 [Unit]
 Description=OMP Telegram Bot Service
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
+# Use the non-root owner of the intended workspace and OMP credentials.
 User=YOUR_SYSTEM_USER
 WorkingDirectory=/path/to/omp-telegram-bot
+# Keep this file readable only by the service user (chmod 600).
 EnvironmentFile=/path/to/omp-telegram-bot/.env
-ExecStart=/path/to/omp-telegram-bot/venv/bin/python bot.py
-Restart=always
+# Set absolute DEFAULT_CWD, OMP_BIN and WORKSPACE_ROOT in .env for host operation.
+ExecStart=/path/to/omp-telegram-bot/venv/bin/python /path/to/omp-telegram-bot/bot.py
+Restart=on-failure
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
-KillMode=mixed
+KillMode=control-group
 TimeoutStopSec=15
 
 [Install]

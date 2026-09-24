@@ -18,14 +18,15 @@ services:
       DEFAULT_CWD: /workspace
       OMP_BIN: /usr/local/bin/omp
       HOME: /home/omp
+      WORKSPACE_ROOT: /workspace
     volumes:
-      # omp CLI binary from the host (read-only)
-      - ${HOST_OMP_BIN:-${HOME}/.local/bin/omp}:/usr/local/bin/omp:ro
-      # omp configuration, model catalog, sessions and credentials
-      - ${HOST_OMP_HOME:-${HOME}/.omp}:/home/omp/.omp
-      # omp provider definitions (models.yaml with provider API keys)
-      - ${HOST_OMP_CONFIG:-${HOME}/.config/oh-my-pi}:/home/omp/.config/oh-my-pi:ro
-      # Workspace: repositories the agent inspects and modifies (read-write)
-      - ${HOST_WORKSPACE_DIR:-${HOME}}:/workspace
+      # Explicit host paths are required: Compose does not expand ~ in bind paths.
+      - ${HOST_OMP_BIN:?Set HOST_OMP_BIN to an absolute executable path}:/usr/local/bin/omp:ro
+      # omp sessions and authentication; keep writable only where omp needs it.
+      - ${HOST_OMP_HOME:?Set HOST_OMP_HOME to an absolute directory}:/home/omp/.omp
+      # Provider definitions (may contain API keys).
+      - ${HOST_OMP_CONFIG:?Set HOST_OMP_CONFIG to an absolute directory}:/home/omp/.config/oh-my-pi:ro
+      # Mount only the intended repository/project root, never the whole home directory.
+      - ${HOST_WORKSPACE_DIR:?Set HOST_WORKSPACE_DIR to an absolute workspace directory}:/workspace
     init: true
     stop_grace_period: 15s
