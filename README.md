@@ -90,7 +90,7 @@ Keep `.env` and provider credentials private. `.dockerignore` sends only `bot.py
 
 #### Option A: Run with Docker Compose (Recommended)
 
-Docker Compose builds the image, matches your host user UID/GID so mounted files retain proper ownership, and mounts your `omp` binary, credentials, and repositories:
+Docker Compose builds the image, matches your host user UID/GID so mounted files retain proper ownership, and mounts your `omp` binary, credentials, and repositories. The container is **not** a sandbox: it runs with host control enabled so the agent can administer the machine it was deployed on.
 
 ```bash
 # Build and start in background
@@ -108,6 +108,31 @@ docker compose down
 
 The mounted OMP binary must run on the image's Linux architecture and glibc; a host executable linked against unavailable libraries will not work. Container Git trusts repositories owned by the mapped UID, **not every path**. If Git reports dubious ownership, correct the workspace ownership or explicitly configure `safe.directory` for that specific trusted repository as the container user; do not use `safe.directory '*'`.
 
+##### Host control inside the container
+
+The service is built for host administration, so it deliberately gives up isolation:
+
+| Setting | Effect |
+|---|---|
+| `privileged: true` + `pid: host` | Host PID namespace reachable, so `nsenter -t 1` enters the real root filesystem, systemd, and process tree |
+| `network_mode: host` | Shares host loopback; `127.0.0.1:8090` (beszel), `127.0.0.1:20128` (9router), and other loopback-only services resolve with no port publishing |
+| `/var/run/docker.sock` | Bundled `docker` CLI drives host containers directly |
+| `/:/host` | Whole host filesystem readable as `/host/...` by the agent's file tools |
+| `HOST_WORKSPACE_DIR:/home/ubuntu` | Host home mounted at its real path, so absolute paths refer to the same file inside and outside the container |
+| Same-named shims | `systemctl`, `journalctl`, `apt-get`, `service`, `ufw`, `ss`, and `apt` run against the host; `host-exec` runs any host command |
+
+`systemctl status nginx` inside the container shows the host's nginx. `host-exec <cmd>` runs `<cmd>` in the host namespaces as root via the passwordless `sudo` rule baked into the image. The bot user (`omp`, matching `HOST_UID`/`HOST_GID`) is a member of the `HOST_DOCKER_GID` group, so the 0660 socket needs no sudo.
+
+**This is not a security boundary.** The agent can do anything the host user can, plus root. Mount only what you intend the agent to modify, and treat the deployment as remote root access to the host.
+
+Mount host paths explicitly — Compose does not expand `~`. `.dockerignore` sends only `bot.py`, `requirements.txt`, and `Dockerfile` to the build context, but runtime bind mounts still expose their contents to OMP.
+
+> **Important:** stop and disable any host `systemd` instance before starting the container, and never run both — two pollers on one token produce Telegram `409 Conflict` errors:
+>
+> ```bash
+> sudo systemctl disable --now omp-bot
+> ```
+
 #### Option B: Run on Bare Metal (Systemd / Local Venv)
 
 If you prefer to run directly on the host:
@@ -124,7 +149,7 @@ pip install -r requirements.txt
 python bot.py
 ```
 
-For host operation, set `OMP_BIN` and `DEFAULT_CWD` to absolute host paths in `.env`; set `WORKSPACE_ROOT` to an absolute directory to confine `/cd`. Without `WORKSPACE_ROOT`, host `/cd` navigation is unrestricted. Run the service as a non-root user with access only to the intended workspace and OMP credentials. OMP uses auto-approval and can execute commands and modify any path accessible to that user; Telegram authorization and `/cd` confinement do not sandbox OMP subprocesses.
+For host operation, set `OMP_BIN` and `DEFAULT_CWD` to absolute host paths in `.env`; set `WORKSPACE_ROOT` to an absolute directory to confine `/cd`. Without `WORKSPACE_ROOT`, host `/cd` navigation is unrestricted. Run the service as a non-root user with access only to the intended workspace and OMP credentials. OMP uses auto-approval and can execute commands and modify any path accessible to that user; Telegram authorization and `/cd` confinement do not sandbox OMP subprocesses. The service account's own privileges are the ceiling: because host runs are not namespaced, the agent sees host `docker`, `systemctl`, `sudo`, host processes, and loopback-only services exactly as that user does — add it to the `docker` group or grant narrow `sudoers` rules only if you intend the agent to use them.
 
 To run as a system service with auto-restart on boot:
 
@@ -141,11 +166,32 @@ sudo systemctl enable --now omp-bot
 journalctl -u omp-bot -f
 ```
 
-Edit the unit's `User`, `WorkingDirectory`, `EnvironmentFile`, and `ExecStart` paths before enabling it. Ensure `.env` is owned by and readable only by the service user (`chmod 600 .env`), and the OMP executable and credentials are available to that same user. The unit uses `KillMode=control-group` so stopping the service terminates spawned tasks. Keep only one polling instance per token; stop the previous instance before switching between Compose and systemd. A restart clears in-memory bot session selections, and an interrupted OMP task is not automatically resumed.
+Edit the unit's `User`, `WorkingDirectory`, `EnvironmentFile`, and `ExecStart` paths before enabling it. Ensure `.env` is owned by and readable only by the service user (`chmod 600 .env`), and the OMP executable and credentials are available to that same user. The unit orders after `network-online.target` and `docker.service`, sets `PYTHONUNBUFFERED=1` for clean journal logging, and uses `KillMode=control-group` so stopping the service terminates spawned tasks. Keep only one polling instance per token; stop the previous instance before switching between Compose and systemd. A restart clears in-memory bot session selections, and an interrupted OMP task is not automatically resumed.
 
 While a task runs, `/stop` remains available; directory, model, thinking-level, branch, and session changes are rejected until the run ends. Failed tasks are not blindly replayed after possible side effects: inspect the workspace and decide whether to send a new prompt. `/checkout` changes to an existing branch without fetching; `/pull` defaults to `--ff-only` and `/push` auto-detects upstream, so fetch or rebase explicitly in your workspace when history has diverged. Inline choice buttons are follow-up turns, not interactive stdin to an in-progress process.
 
 > **Important:** Run one polling instance per token (Docker **or** systemd, not both); concurrent polling produces Telegram `409 Conflict` errors.
+
+### Upgrading the OMP CLI
+
+The bot never bundles `omp`: Docker bind-mounts your host binary (`HOST_OMP_BIN` → `/usr/local/bin/omp:ro`), and host runs execute `OMP_BIN` directly. Upgrading omp is a host binary update plus a bot restart — no image rebuild unless `bot.py`, `Dockerfile`, or `requirements.txt` changed.
+
+```bash
+# 1. Let the running task finish (or /stop it): a restart kills in-flight
+#    tasks and clears in-memory session/model selections.
+omp update            # or `omp update --check` to preview first
+omp --version
+
+# 2. Docker Compose deployment
+docker compose restart omp-bot
+docker exec omp-telegram-bot /usr/local/bin/omp --version   # verify
+
+# 2. Host / systemd deployment
+sudo systemctl restart omp-bot
+journalctl -u omp-bot -n 5
+```
+
+`OMP_BIN` is resolved once at bot startup, so a restart is required even though the path is unchanged. If an omp update changes its install path, update `HOST_OMP_BIN`/`OMP_BIN` in `.env` and run `docker compose up -d` (recreate, not just restart). Sessions in `HOST_OMP_HOME` survive updates; only major version jumps may make very old sessions unreadable for `-r` resume. If a release changes the JSON event shapes or CLI flags the bot parses (`-p --auto-approve --mode json`, `--model`, `--thinking`, `-r`, `models --json`, or the `session`/`message_*`/`tool_execution_*`/`agent_end` events), update this repo (`git pull` + `docker compose up -d --build`) before restarting.
 
 ---
 

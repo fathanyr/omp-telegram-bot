@@ -9,9 +9,25 @@ services:
         # Set these in .env:  HOST_UID=$(id -u)  HOST_GID=$(id -g)
         UID: ${HOST_UID:-1000}
         GID: ${HOST_GID:-1000}
+        # Group that owns /var/run/docker.sock on the host, so the bot user can
+        # open it:  stat -c %g /var/run/docker.sock
+        DOCKER_GID: ${HOST_DOCKER_GID:-999}
     image: omp-telegram-bot:latest
     container_name: omp-telegram-bot
     restart: unless-stopped
+
+    # ---- Host control -------------------------------------------------------
+    # `privileged` exposes the host kernel namespaces and device access; with
+    # `pid: host` the host PID namespace is reachable, so `nsenter -t 1` can run
+    # any command against the real root filesystem, systemd, and process tree.
+    # `network_mode: host` shares host loopback, so 127.0.0.1 services (beszel on
+    # 8090, 9router on 20128) resolve without port publishing.
+    # Net effect: the container boundary is advisory, not a security boundary.
+    privileged: true
+    pid: host
+    network_mode: host
+    # -------------------------------------------------------------------------
+
     env_file:
       - .env
     environment:
@@ -32,5 +48,17 @@ services:
       - ${HOST_SSH_DIR:?Set HOST_SSH_DIR to an absolute SSH directory}:/home/omp/.ssh:ro
       # Mount only the intended repository/project root, never the whole home directory.
       - ${HOST_WORKSPACE_DIR:?Set HOST_WORKSPACE_DIR to an absolute workspace directory}:/workspace
+
+      # ---- Host access ------------------------------------------------------
+      # Host daemon socket, so the bundled docker CLI drives host containers.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Whole host filesystem at /host: host /X is readable as /host/X, which
+      # keeps every host file reachable to the read/edit/grep tools. The host's
+      # own /host does not exist, so this never nests.
+      - /:/host
+      # Host home at its real path, so the primary workspace and any absolute
+      # path under it are identical inside and outside the container.
+      - ${HOST_WORKSPACE_DIR}:/home/ubuntu
+      # -----------------------------------------------------------------------
     init: true
     stop_grace_period: 15s

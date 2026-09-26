@@ -134,5 +134,15 @@ The bot can run containerized (`docker compose`) or via host `systemd`:
 | `${HOST_OMP_CONFIG}` | `/home/omp/.config/oh-my-pi` | ro | Provider definitions (`models.yaml`) |
 | `${HOST_WORKSPACE_DIR}` | `/workspace` | rw | One explicitly selected repository or project directory |
 | `${HOST_SSH_DIR}` | `/home/omp/.ssh` | ro | Host SSH keys (`id_ed25519`/`id_rsa`) and `known_hosts` for Git SSH remotes |
+| `/var/run/docker.sock` | `/var/run/docker.sock` | rw | Host Docker daemon socket |
+| `/` | `/host` | rw | Whole host filesystem for file operations and path inspection |
+| `${HOST_WORKSPACE_DIR}` | `/home/ubuntu` | rw | Host workspace path identity |
 
 Compose requires absolute host paths, maps host UID/GID, sets `WORKSPACE_ROOT=/workspace`, and does not grant blanket Git `safe.directory` trust. Host systemd runs as a non-root workspace owner with absolute host `OMP_BIN` and `DEFAULT_CWD`; set `WORKSPACE_ROOT` to confine `/cd` (without it, host navigation is unrestricted). The boundary restricts `/cd`, not OMP subprocess filesystem access. Only one polling instance may use a bot token.
+
+**Host privilege model**: both Docker and bare-metal deployments are deliberately wired for host administration, so neither forms a security boundary.
+- **Bare-metal systemd**: runs unnamespaced as the service account; group memberships and `sudoers` rules define reach.
+- **Docker Compose**: uses `privileged: true`, `pid: host`, `network_mode: host`, `/var/run/docker.sock`, and `/host`. The image bakes an unprivileged bot user with passwordless `sudo`, group membership for the host docker GID, a `host-exec` helper that enters host PID 1 namespaces via `nsenter -t 1 -m -u -i -n -p --`, and same-named shims (`systemctl`, `journalctl`, `apt-get`, `service`, `ufw`, `ss`, `apt`). Host loopback services (`127.0.0.1:8090`, `127.0.0.1:20128`) are directly reachable.
+Neither deployment sandboxes the agent from the host; both represent remote root execution through Telegram.
+
+**omp CLI upgrades**: `HOST_OMP_BIN` is mounted read-only, so `omp update` runs on the host, never inside the container. `OMP_BIN` is read once at startup, and a running container keeps the old binary inode even after the host file is replaced; apply an upgrade with a host-side `omp update` followed by `docker compose restart omp-bot` (or `docker compose up -d` when the install path itself changed) or `systemctl restart omp-bot`. Restarts clear in-memory session state, so they MUST NOT interrupt an active task. Rebuild the image only when `bot.py`, `Dockerfile`, or `requirements.txt` change; if a release alters the parsed flags or JSON events, update the repository first.
