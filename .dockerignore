@@ -1,5 +1,6 @@
 # Only the runtime source and requirements are needed in the image.
 **
 !bot.py
+!notify.py
 !requirements.txt
 !Dockerfile

@@ -75,7 +75,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Do not mark arbitrary mounted repositories as safe. Matching host UID/GID
 # lets Git trust repositories owned by the container user; fix ownership or
 # configure an explicit safe.directory for a known repository if necessary.
-COPY --chown=${USERNAME}:${USERNAME} bot.py ./
+COPY --chown=${USERNAME}:${USERNAME} bot.py notify.py ./
 
 USER ${USERNAME}
 
